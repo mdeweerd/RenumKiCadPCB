@@ -1,16 +1,18 @@
 /*
- * RenumKiCadPCB.c v0.203
+ * RenumKiCadPCB.c v0.203-1
  *
- *  Created on: Aug 3, 2016
+ *  Created on: Aug 3, 2016 (v0.203)
  *      Author: Brian
+ *  Modified on Apr 11, 2021 - Author MDW
  */
+#define VERSION "0.203-1"
 
 /*
  * RenumKiCadPCBV200.c
  *
  *  Created on: Aug 15, 2016
  *      Author: Brian Piccioni DocumentedDesigns.com
- *      (c) Bian Piccioni
+ *      (c) Brian Piccioni
  *
  *      This is free software made available under the GNU General Public License(GPL) version 3 or greater.
  *      see https://www.gnu.org/licenses/gpl-3.0.en.html
@@ -59,6 +61,7 @@
  *						ref des change plan files (_coord.txt, _update.txt, _change.txt).
  *						Removed Verbose, and Show Change Plan option. Fixed bug where ref des offset are relative to module
  *						axis not relative to module center
+ *	V0.203-1			Cleaned up help, fix some typos.  Added Makefile
  *
  *	To do 				Figure out a GUI
  *						Add a function to strip prepend strings
@@ -293,7 +296,7 @@ struct ParameterType G_ParameterFile[] =
 		{"Top Start Reference Designation=", 'N', &G_TopStartRefDes },
 		{"Bottom Start Reference Designation=", 'N', &G_BottomStartRefDes },
 		{"Sort on Modules/Reference Designators=", 'N', &G_SortOnModules },
-		{"Grid =", 'F', &G_Grid },
+		{"Grid=", 'F', &G_Grid },
 		{0,0,0}
 	};
 
@@ -1625,9 +1628,12 @@ int		i = 0;
 
 	do
 	{
-		if( strcmp( DirArray[i].abbreviation, argv ) == 0 )
+		if( strcmp( DirArray[i].abbreviation, argv ) == 0 ) {
 			*SortCode = DirArray[i].code;
-	}while( DirArray[i++].abbreviation != NULL );
+			puts(argv);
+		}
+	}while( DirArray[++i].abbreviation != NULL );
+	// TODO: Notify when code is invalid
 }
 
 /*
@@ -2321,7 +2327,7 @@ int		i = -1;
 				break;
 
 				case 'H' :
-					PrintHelpFile( G_ERRSTR );				//Use a dummy argument
+					PrintHelpFile( NULL );				//Use a dummy argument
 					break;
 
 				case 'L' :
@@ -2348,27 +2354,27 @@ int		i = -1;
  */
 
 
-char	G_HELPFILE[] = "\nRenumberKiCadPCB command line options								\n\
--iInfile	The Input file names (infile.kicad_pcb,  infile.sch) (required)					\n\
-		Infile is renamed infileRenumBack.kicad_pcb, infileRenumBack.sch					\n\n\
--fs		Front sort direction																\n\
-		-fs[1ST][2ND] where [1ST or [2ND] are TB (top to bottom) or LR (left to right		\n\
-		DEFAULT is fsTBLR (top to bottom, left to right)									\n\
--bs		Bottom sort direction same arguments as -fs											\n\n\
-		DEFAULT is bsTBRL (top to bottom, right to left)									\n\n\
--j		Set the sort grid spacing (i.e 0.1 and 0.15 are the same if grin is 0.5	)			\n\n\
--fp		Top refdes prepend string (i.e. tpT_ means R1 will be T_R1 if it is on top side		\n\
-		DEFAULT is empty																	\n\n\
--bp		Bottom refdes prepend string (i.e. bpB_ means R2 will be B_R2 if it is on bottom side\n\
-		DEFAULT is empty																	\n\n\
--fr		Top refdes start value (i.e. fp100 means parts will start at 100 on the front side	\n\
-		DEFAULT is 1																		\n\n\
--br		Bottom refdes start value (i.e. br100 means R2 will be R102 if it is on bottom side	\n\
-		DEFAULT is to continue from the last front refdes									\n\n\
--m		Sort on module location. Default is sort on Ref Des Location						\n\
--y		No Y/N question asked																\n\
--z		Zero settings (reset to defaults) 													\n\
--?		Print out this file\n\n";
+char	G_HELPFILE[] = "\nRenumKiCadPCB " VERSION " command line options\n"
+"-iINFILE	The Input file names (INFILE.kicad_pcb, INFILE.sch) (required)\n"
+"		INFILE is renamed infileRenumBack.kicad_pcb, infileRenumBack.sch\n\n"
+"-fsSORTSPEC	Front sort direction\n"
+"		-fs[1ST][2ND] where [1ST] or [2ND] are TB (top to bottom) or LR (left to right)\n"
+"		DEFAULT is -fsTBLR (top to bottom, left to right)\n"
+"-bsSORTSPEC	Bottom sort direction same arguments as -fs\n\n"
+"		DEFAULT is -bsTBRL (top to bottom, right to left)\n\n"
+"-jSPACING	Set the sort grid spacing (i.e 0.1 and 0.15 are the same if grid is 0.5)\n\n"
+"-fpSTR		Top refdes prepend string (i.e. tpT_ means R1 will be T_R1 if it is on top side)\n"
+"		DEFAULT is empty\n\n"
+"-bpSTR		Bottom refdes prepend string (i.e. bpB_ means R2 will be B_R2 if it is on bottom side)\n"
+"		DEFAULT is empty\n\n"
+"-frNUM		Top refdes start value (i.e. fp100 means parts will start at 100 on the front side)\n"
+"		DEFAULT is 1\n\n"
+"-brNUM		Bottom refdes start value (i.e. br100 means R2 will be R102 if it is on bottom side)\n"
+"		DEFAULT is to continue from the last front refdes)\n\n"
+"-m		Sort on module location. Default is sort on Ref Des Location)\n"
+"-y		No Y/N question asked\n"
+"-z		Zero settings (reset to defaults)\n"
+"-?		Print out this file\n\n";
 
 
 /*
@@ -2378,6 +2384,7 @@ char	G_HELPFILE[] = "\nRenumberKiCadPCB command line options								\n\
 void	PrintHelpFile( char *argv )
 {
 	printf("%s", G_HELPFILE );
+	if(argv!=NULL) exit(0); // Exit when the tool is not interactive
 }
 
 
