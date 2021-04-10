@@ -1,16 +1,11 @@
-/*
- * RenumKiCadPCB.c v0.203-1
- *
- *  Created on: Aug 3, 2016 (v0.203)
- *      Author: Brian
- *  Modified on Apr 11, 2021 - Author MDW
- */
-#define VERSION "0.203-1"
+//#define _ECLIPSEDEBUG    1
 
 /*
- * RenumKiCadPCBV200.c
- *
- *  Created on: Aug 15, 2016
+ * RenumKiCadPCB.c v0.352-1
+ */
+#define VERSION "0.352-1"
+
+/*
  *      Author: Brian Piccioni DocumentedDesigns.com
  *      (c) Brian Piccioni
  *
@@ -28,45 +23,38 @@
  *		the problem or feature need.
  *
  * Changes:
- * 	V0.101 	Replaced 	"printf(ERRSTR)" with puts ( ERRSTR ) in ParseCommandLine because of compiler warning under Linux
- * 			Added		return( ERRINVALIDEXIT ); because of compiler warning under Linux
- * 			Moved		gettimeofday( ); from main() to ParseCommandLine and changed abort decision to ensure valid run time reported
+ *  V0.300				Do all changes in memory before writing to files.
+ *  					If there are warnings, ask whether to commit changes
+ *  					Then backup all files, write out new ones.
+ *  					Fixed ability to have a non-file extent "." i.e TERES_PCB1-A64-MAIN_Rev.C.pro
+ *  					Fixed a number of bugs associated with/exposed by weird file content in TERES_PCB1-A64-MAIN_Rev.C.pro
  *
- *	V0.102	Rewrote much of the code to support schematic hiearchy sheets
- *			Added		-n (don't ask a question) to the command line
- *			Removed		-oOutputfile because it would not work with hierarchies
+ *	V0.350				Try and prep for eventual integration with KiCad
+ *						Separate UI fro the actual function software
+ *						Removed command line parsing (redundant given remembered parameters)
  *
- *	V0.103	Added 		UpdatePCBNetNames to deal with KiCad and pours
-
- *	V0.104	Rewrote 	UpdatePCBFileRefDes to do both the NetNames and the reference designations
- *						This cleans up and speeds up the process
- *						Fixed problem with ExtractPath when in the same directory as the files
+ * ## Side : top
+ * # Ref     Val         Package                PosX       PosY       Rot  Side
+ * C1        0.1uF       C_1206             201.4460   -98.171
  *
- *	V0.105				Modified ExtractPath to trim file extensions (i.e. filename.kicad_PCB is the same as filename)
- *						Moved files over to MingW which means no DLL is needed - the code is standalone.
- *						Added code to strip quotes inserted by Eclipse or Mingw on command line arguments
- *						Changed fread/fwrite attribute to rb, wb because Mingw libraries didn't like a character in the text files
+ *  V0.352              Deal with "phantom sheets" problem. Long story short, the way KiCad handles hierarchical sheets is weird
+ *                      and inconsistent. If you have (for example) two sheets and then delete one (or, I think, put  sheet in,
+ *                      delete it, and add another) the AR field for the deleted sheet remains. It includes a reference designation
+ *                      (ie. D?). If you do the annotation the reference designations, the AR field (but not the L field) for the
+ *                      component on the sheet which is there is updated but the “ghost” sheet is not.
  *
- *	V0.200				Added a menu driven interface. Changed command line arguments to align with menu.
- *						Flag warnings for parts found on PCB but not in schematic (except those flagged as ignore)
+ *                      I don't flag errors if I get a ? in a reference designation for the component unless all are ?
  *
- *	V0.201				Store /clear default values
+ *                      Fixed blanking missing refdes if ut of sync netlist
  *
- *	V0.202				Changed "Jog" approach to "Grid" approach
+ *                      Fixed taking first layer as Front Side now use Layers list for layer 0 as front
  *
- *	V0.203				Cleaned up code. Do a global "round to grid". Write out log file, change file, etc.,
- *						removed Verbose, and Show Change Plan option. Fixed bug where ref des offset are relative to module
- *						axis not relative to module center
- *	V0.203				Cleaned up code. Do a global "round to grid". Write out coordinate file, update list, and
- *						ref des change plan files (_coord.txt, _update.txt, _change.txt).
- *						Removed Verbose, and Show Change Plan option. Fixed bug where ref des offset are relative to module
- *						axis not relative to module center
  *	V0.203-1			Cleaned up help, fix some typos.  Added Makefile
  *
- *	To do 				Figure out a GUI
- *						Add a function to strip prepend strings
+ *		 				Figure out a GUI
  *
  */
+
 
 #include	<stdio.h>
 #include	<stdlib.h>
@@ -75,7 +63,8 @@
 #include	<time.h>
 #include 	<sys/time.h>
 #include 	<math.h>
-
+#include 	<unistd.h>
+#include    <stdbool.h>
 
 #ifdef		_WIN64
 	#define		Windows
@@ -88,10 +77,13 @@
 
 #ifdef		Windows					//Windows
 #include	<conio.h>
+char        SLASHCHR = '\\';          //Windows file path slash
 #else	//Linux
+
 
 #include <termios.h>
 #include <unistd.h>
+char        SLASHCHR = '/';          //Linux/Unix/Apple file path slash
 int	getch(void);
 #endif
 
@@ -117,6 +109,7 @@ int	getch(void);
 #define	DESCENDINGSECOND	0b01				//Sort high to low
 
 #define	MINGRID 0.001
+#define	DEFAULT_GRID 1.0
 
 #define	TRUE 				1
 #define FALSE 				0
@@ -140,39 +133,42 @@ int	getch(void);
 
 #define	SKIPREFDES			-1	//Skip this refdes
 
-#define FILENOTFOUND 		1	//File not found error code
-#define MALLOCERROR 		2	//Can't allocate memory error code
-#define READERROR  			3	//Can't read the file error code
-#define	NOMODULESERROR 		4	//No (modules field in file
-#define	ERRNOCOORD			5	//Module had no coordinate
-#define	MODULEMISSMATCH		6	//Different number modules from declaration
-#define	OUTFILEOPENERROR 	7	//Can't open the output file
-#define	OUTFILEWRITEERROR	8	//Can't write to the outputfile
-#define	NOCHANGERROR		9	//Can't find the refdes in the change array
-#define	PCBMISSMATCHERROR	10	//Mismatch in modules found during update
-#define	SCHWRITECREATEERROR	11	//Can't create schematic output file
-#define	SCHMISSINGLERROR	12	//Missing L in schematic file
-#define	SCHWRITEERROR		13	//Can't write to schematic output file
-#define	ARGERROR 			14	//Not enough arguments
-#define	PCBBACKUPERROR		15	//Can't back up the PCB file
-#define	SCHBACKUPERROR		16	//Can't back up the SCH file
-#define NOINPUTFILEERROR	17	//No input file specified
-#define	ERRNABORT			18	//User aborted
-#define	ERRINVALIDEXIT		19	//Somehow exit main without clean exit
-#define	PARAMWRITECREATEERROR 20	//Can't write the parameter file
+#define FILENOTFOUND 				1		//File not found error code
+#define MALLOCERROR 				2		//Can't allocate memory error code
+#define READERROR  					3		//Can't read the file error code
+#define	NOMODULESERROR 				4		//No (modules field in file
+#define	ERRNOCOORD					5		//Module had no coordinate
+#define	MODULEMISSMATCH				6		//Different number modules from declaration
+#define	OUTFILEOPENERROR 			7		//Can't open the output file
+#define	OUTFILEWRITEERROR			8		//Can't write to the outputfile
+#define	NOCHANGERROR				9		//Can't find the refdes in the change array
+#define	PCBMISSMATCHERROR			10		//Mismatch in modules found during update
+#define	SCHWRITECREATEERROR			11		//Can't create schematic output file
+#define	SCHMISSINGLERROR			12		//Missing L in schematic file
+#define	SCHWRITEERROR				13		//Can't write to schematic output file
+#define	ARGERROR 					14		//Not enough arguments
+#define	PCBBACKUPERROR				15		//Can't back up the PCB file
+#define	SCHBACKUPERROR				16		//Can't back up the SCH file
+#define NOINPUTFILEERROR			17		//No input file specified
+#define	ERRNABORT					18		//User aborted
+#define	ERRINVALIDEXIT				19		//Somehow exit main without clean exit
+#define	PARAMWRITECREATEERROR 		20		//Can't write the parameter file
+#define	SCHNOARREFERROR				21		//Missing the "Ref= in AR code
+#define	TOPBOTTOMDEFINITIONERROR 	22		//Top/bottom definition mismatch
+#define	TOOMANYMODULELAYERS			23		//More than 2 module layers
+#define	NETBACKUPERROR				24		//Can't back up the NETLIST file
+#define	NETWRITECREATEERROR			25
+#define	BADNETLIST					26
 
-#define	SCHNOARREFERROR	20		//Missing the "Ref= in AR code
-#define	SCHNOARREFERROR	20		//Missing the "Ref= in AR code
-
-#define	TEMPFILENAME		"RenumKiCadPCB"
+#define	MAXPATH		2048
 
 struct	KiCadModule {
-	char	layer;						//What layer the module is on (usually 1 or 2)
-	float	coord[2];					//X ad Y coordinate
+	char	layer;							//What layer the module is on (usually 1 or 2)
+	float	coord[2];						//X ad Y coordinate
 	char 	RefDesType[MAXREFDES+1];		//What the RefDes Preamble is (i.e. U, R VR, etc.)
 	char 	RefDesString[MAXREFDES+1];		//What the RefDes Preamble is (i.e. U, R VR, etc.)
-	int 	RefDes;						//And what the RefDes is (i.e. 23)
-	int		index;						//Used for sorting
+	int 	RefDesNum;							//And what the RefDes is (i.e. 23)
+	int		index;							//Used for sorting
 };
 
 
@@ -180,101 +176,17 @@ struct	RefDes
 {
 	char 	RefDesType[MAXREFDES+1];			//What the RefDes Preamble is (i.e. U, R VR, etc.)
 	char	OldRefDesString[MAXREFDES+1];		//What the old refdes preamble + number was
-	char	*prepend;						//The prepend string
-	int		OldRefDes;
-	int 	NewRefDes;						//And what the RefDes is (i.e. 23)
-	int		Found;							//Found the ref des in the schematic
+	char	*prepend;							//The prepend string
+	int		OldRefDesNum;
+	int 	NewRefDesNum;							//And what the RefDes is (i.e. 23)
+	int		Found;								//Found the ref des in the schematic
 };
 
-
-//
-// Function prototypes
-//
-char	*LoadFile( char *path, char *fname, char *extension );
-void	ExtractPath( char *filename, char *path );
-int		MakeBackupFile( char *path, char *filename, char *extension );
-void	MakeFileName( char *filename, char *path, char *fname, char *extension, int namesize );
-FILE	*OpenDebugFile( char *path, char *filename, char *ftype, char *extension, char *prompt );
-
-int		LoadModuleArray( struct KiCadModule *ModuleArray, int modules, char *buffer ); 		//Load up the module array
-
-void	FreeMemoryAndExit( int code );
-void	RenumError( char *message, int code );
-
-char	*FindAndSkip( char *dest, char *buffer, char *instr, char *limit );
-char	*CopyText( char *dest, char *source );		//Copy the text part
-void	SortOnXY( struct KiCadModule*sortarray, int XY, int sortdirection, float grid  );
-void	SortKiCadModules( struct KiCadModule *modulearray, int modules, int sortcode );
-int		MakeRefDesTypesArray( struct RefDes *outarray, struct KiCadModule *ModuleArray, int modules );
-void	SetRefDesTypeStart( struct RefDes *typesarray, int startrefdes );					//Set to the starting top refdes
-void	MakeRefDesChangeArray( struct KiCadModule *modulearray, struct RefDes *refdestypesarray,
-					struct RefDes *refdeschangecrray, int modules, char *prepend, FILE *filehandle, char *text );
-
-int		GetModuleCount( char *buffer );
-
-
-void	UpdateSchematicFileRefDes( char *path, char *fname, int modules, struct RefDes *RefDesChangeArray );
-void	fprintfbuffer( char *buffer );
-void	UpdatePCBFileRefDes( char *path, char *fname, int modules, struct RefDes *RefDesChangeArray, char *buffer );
-
-void	CopyKiCadModuleArrayElement( struct KiCadModule *dest, struct KiCadModule *source, float grid );
-void	CopyKiCadModuleArray( struct KiCadModule *dest, struct KiCadModule *source, int modules, float grid );
-int		CountTopModules( struct KiCadModule *ModuleArray,  int Modules );
-int		SplitTopBottom( int Modules, int TopModules, struct KiCadModule *ModuleArray, struct KiCadModule *TopModuleArray, struct KiCadModule *BottomModuleArray  );
-void	ParseCommandLine( int argc, char *argv[] );
-void	ShowAndGetParameters( void );
-void	RenumError( char *message, int code );
-void	PrintHelpFile( char *argv );
-
-void	PullFieldString( char *dest, char *buffer, char *instr );
-int		CrawlSheets( char *path, char *SheetName, char *SheetNamePointer[], int *NumberOfSheets, int *SheetNameSize );
-void	SafeStringCopy( char *dest, char *source, int bufsize );
-void	SafeStringConcatinate( char *dest, char *source, int maxlen );
-void	AddSheetName( char *SheetName, char *SheetNameList[] );
-char	*ScanForSheets( char *scanner, char *sheetnamedest, int *sheetsize );
-void	UpDateSchematicHierarchy( char *path, char *fname, int modules, struct RefDes *RefDesChangeArray );
-int		mygetch( void );
-
-void	LoadParameterFile( void );
-void	WriteParameterFile( void );
-void	ResetParameters( void );
-
-/*
- * Global variables (mostly filled by command line arguments )
- */
-
-#define	MAXPATH		2048
-#define	MAXPREPEND	MAXREFDES
-
-char	G_FileName[ MAXPATH ];
-char	G_TopPrependString[ MAXPREPEND ];
-char	G_BottomPrependString[ MAXPREPEND ];
-char 	G_ERRSTR[MAXSTRING];							//Common error string
-
-char	*G_InputFileName = "";							//The input file name set by command line
-char	*G_TopPrepend = "";								//T_";
-char	*G_BottomPrepend = "";							//Optional strings to prepend to new refdeses
-
-int		G_NoQuestion = 0;								//Don't ask if OK
-
-int		G_TopSortCode = SORTYFIRST + ASCENDINGFIRST + ASCENDINGSECOND;
-int		G_BottomSortCode = SORTYFIRST + ASCENDINGFIRST + DESCENDINGSECOND;
-
-int		G_TopStartRefDes = 1;							//Start at 1 for the top
-int		G_BottomStartRefDes = 0;	//1;				//Start at 1 for the bottom (this is optional)
-int		G_SortOnModules = 1;							//if 0 sort on ref des location
-float	G_Grid = 0.75;									//Anything near this (mm) is in the same line
-
-
-/*
- * The Say Hello String
- */
-char	G_HELLO[] =
-"\nRenumKiCadPCB V0.203\nReleased under GPL 3.0 or later. See source for details.\
-\n**** No warranty : use at your own risk ****\
-\nWritten by Brian Piccioni. \nEmail brian@documenteddesigns.com with bug reports or feature requests";
-
-
+struct	KiCadFileInMemory {						//How Kicad files are stored
+char	filename[MAXPATH];						//The full file name
+long	maxfilesize;							//The maximum size of the file (includes room for modules, etc
+char	*filebuffer;							//And the pointer to the buffer
+};
 
 
 struct	ParameterType {
@@ -284,194 +196,369 @@ struct	ParameterType {
 	};
 
 
-struct ParameterType G_ParameterFile[] =
-	{
-		{"File Name=", 'T', &G_FileName },
-		{"Top Prepend=", 'T', &G_TopPrependString },
-		{"Bottom Prepend=", 'T', &G_BottomPrependString },
+struct	RenumParams
+{
+char	*projectfilename;	//Name of the project file (.pro stripped)
+char    *projectpath;
+char	*pcbbuffer;			//Where the PCB is in memory
+char	*TopPrepend;		//The Top Prepend string
+char	*BotPrepend;		//The Bottom Prepend string
+int		topsortcode;		//The Top sort code (left to right, etc.)
+int		bottomsortcode;		//The Bottom sort code (left to right, etc.)
+int		topstartrefdes;		//The starting top ref des
+int		bottomstartrefdes;	//The starting bottom ref des
+int		sortonmodules;		//Sort on modules/ref des
+float	grid;				//The sort grid
 
-		{"No Question=", 'N', &G_NoQuestion },
-		{"Top Sort Direction=", 'N', &G_TopSortCode },
-		{"Bottom Sort Direction=", 'N', &G_BottomSortCode },
-		{"Top Start Reference Designation=", 'N', &G_TopStartRefDes },
-		{"Bottom Start Reference Designation=", 'N', &G_BottomStartRefDes },
-		{"Sort on Modules/Reference Designators=", 'N', &G_SortOnModules },
-		{"Grid=", 'F', &G_Grid },
-		{0,0,0}
-	};
+//struct	ProjectFileStruct	*ProjectFile;
+//struct 	ProjectFileStruct 	*SchFile;
+struct 	KiCadModule 		*ModuleArray;
+struct 	KiCadModule 		*TopModuleArray;						//Pointer to top side ModuleArray
+struct 	KiCadModule 		*BottomModuleArray;					//Pointer to bottom side ModuleArray
+struct 	RefDes 				*RefDesChangeArray; 						//Pointer to changes array
+struct 	RefDes 				*RefDesTypeArray;							//Pointer to refdes type array
 
-#define	PARAMETERFILENAME	"RenumParameters.txt"
+int		NumberOfSheets;
+int		Modules;
+int		TopModules;
+int		BottomModules;		//The number of modules in the PCB, Top and Bottom
+int		NumRefDesTypes;
+char	*paramfilename;		//Parameter file name to read/write
 
+int		errcount;			//The error count
+struct 	timeval	StartTime;	//Program run start time
+struct 	timeval	EndTime;	//Program run end time
 
-struct timeval	G_StartTime;							//Program run start time
-struct timeval	G_EndTime;								//Program run end time
+FILE    *loghandle;       //Used for tracking of issues
+
+int     log;
+
+};
+
+#define LOGCOORD    0X01
+#define LOGPLAN     0X02
+#define LOGCHANGE   0X04
+//
+// Function prototypes
+//
+
+int 	RenumKiCadPCB( struct RenumParams *Params );
+int		FindSchematicComponent( struct RenumParams *Params , char *dest, char *field, int *err_report );
+int		FlushFile( struct KiCadFileInMemory *FileList );
+char	*CopyBuffer( char *outbuffer, char *input );
+char 	*CopyHereToThere( char *dest, char *from, char *to );
+void	ClearKiCadFileInMemoryStruct( struct KiCadFileInMemory *FileList, int NumberOfEntries );
+int		CountStrings( char *buffer, char *string );
+void	CrawlSheets( char *path, char *SheetName, struct KiCadFileInMemory *FileList, int *NumberOfSheets );
+char	*ScanForSheets( char *scanner,  struct KiCadFileInMemory *SheetStruct );
+char	*LoadFile( char *filename, long *sizepoint );
+int     CheckInputFileName( struct RenumParams *Params, char *extension );
+int		MakeBackupFile( char *filename );
+void	MakeFileName( char *dest, char *path, char *filename, char *extension );
+void    TrimExtension( char *filename, char *extension );
+
+void	LoadModuleArray( struct RenumParams *Params ); 		//Load up the module array
+void	FreeMemoryAndExit( int code );
+void	RenumError( char *message, int code );
+char	*FindAndSkip( char *dest, char *buffer, char *instr, char *limit );
+char	*CopyText( char *dest, char *source, int size );		//Copy the text part size limited
+void	RoundToGrid( struct RenumParams *Params );
+void	SortOnXY( struct KiCadModule*sortarray, int XY, int sortdirection, float grid  );
+void	SortKiCadModules( struct RenumParams *Params, char Side );
+void	MakeRefDesTypesArray( struct RenumParams *Params, char CountOrFill );
+void	SetRefDesTypeStart( struct RenumParams *Params, char Side );					//Set to the starting top refdes
+void	MakeRefDesChangeArray( struct RenumParams *Params, char Side );
+int		GetModuleCount( char *buffer );
+void	UpdatePCBFileRefDes( struct RenumParams *Params, struct	KiCadFileInMemory *FileList );
+void	UpdateSchematicFileRefDes( struct RenumParams *Params, struct KiCadFileInMemory *FileList );
+void	UpdateNetlistRefDes( struct RenumParams *Params, struct KiCadFileInMemory *FileList );
+void	ProcessComponent( struct RenumParams *Params , char *dest, char *source );
+void	CopyKiCadModuleArrayElement( struct KiCadModule *dest, struct KiCadModule *source, float grid );
+void	CopyKiCadModuleArray( struct KiCadModule *dest, struct KiCadModule *source, int modules, float grid );
+int		CountModules( struct KiCadModule *ModuleArray,  int Modules, char layer );
+void	SplitTopBottom( struct RenumParams *Params );
+void	PullFieldString( char *dest, char *buffer, char *instr );
+void	SafeStringCopy( char *dest, char *source, int bufsize );
+void	SafeStringConcatinate( char *dest, char *source, int maxlen );
+void	AddSheetName( char *SheetName, char *SheetNameList );
+int		mygetch( void );
+void	RefDesToString( char *outstr, int refdes );
+void	MakeNewRefDes( char *NewRefDes, struct RefDes *RefDesChangeArray );
+void	SortSide( struct RenumParams *Params, char Side );
+void    LineItUp( struct RenumParams *Params, char *text, int tab  );
+char    *strcasestr(const char *s, const char *find);
+
+void	LoadParameterFile( struct RenumParams *Params );
+void	WriteParameterFile( struct RenumParams *Params );
+void	ShowAndGetParameters( struct RenumParams *Params );
+void	ShowMenu( struct RenumParams *Params );
 
 /*
- * These are here to ensure all handles are closed/freed
+ * The Say Hello String
  */
-FILE 	*G_WriteFile;							//Write file handle
-char	*G_Buffer;								//Used for malloc
+char	G_HELLO[] =
+"\nRenumKiCadPCB v" VERSION "\nReleased under GPL 3.0 or later. See source for details.\
+\n**** No warranty : use at your own risk ****\
+\nWritten by Brian Piccioni. \nEmail brian@documenteddesigns.com with bug reports or feature requests";
 
+
+char	G_ERRSTR[MAXPATH];
+
+#define	PARAMETERFILENAME	"RenumParameters.txt"
 
 /*
  * Let us begin
 */
 int main( int argc, char *argv[] )
 {
-int		i, Modules, TopModules, BottomModules;		//The number of modules in the PCB, Top and Bottom
+struct	RenumParams	Params;
+char	projectfilename[ MAXPATH ] = "";
+char    projectpath[ MAXPATH ] = "";
+char	TopPrepend[ MAXREFDES ] = "";
+char	BotPrepend[ MAXREFDES ] = "";
 
 		setvbuf (stdout, NULL, _IONBF, 0);			//direct output to eclipse console
-		if( argc > 1)
-			ParseCommandLine( argc, argv );			//If there are command line arguments handle them
-
-		if( G_Grid < MINGRID ) G_Grid = MINGRID;	//Make sure sort grid is > 0
-
-		ShowAndGetParameters();						//Show what you got and allow them to change
-
-		G_WriteFile = NULL;							//Write file handle
-		WriteParameterFile( );						//Save these for later
-
-
-/*
-* Now process start the work
-*/
-char	path[ strlen( G_InputFileName ) + 1 ];
-char	*buffer;
-
-		ExtractPath( G_InputFileName, path );							//Get the part part of the source/destination
-
-		printf("\n\nLoading PCB file %s.kicad_pcb", G_InputFileName );
-		buffer = LoadFile( path, G_InputFileName, ".kicad_pcb" );		//Load this file and extension
-
-		Modules = GetModuleCount( buffer );								//Extract the (modules field
-struct KiCadModule ModuleArray[ Modules ];								//Allocate memory for the ModuleArray
-
-		LoadModuleArray( ModuleArray, Modules, buffer ); 				//Load up the module array
-
-FILE	*debughandle;
-float	rounder, old_x, old_y;
-
-		debughandle = OpenDebugFile( path, G_InputFileName, "_coord", ".txt", "Coordinate" );
-
-		if( G_SortOnModules != 0 )						//Only if sorting by reference designator coordinate
-			fprintf(debughandle, "**************************** Module Coordinates ***************************************");
-		else
-			fprintf(debughandle, "*********************** Reference Designator Coordinates *****************************");
-
-		fprintf(debughandle, "\n#\tF/B\tRef\tX Coord\tY Coord\t\tGrid X\tGrid Y");
-
 //
-// Round the Module Array to the grid (only do this once)
+// Set up defaults
 //
-		for( i = 0; i < Modules; i++ )
-		{
-			old_x = ModuleArray[i].coord[0];
-			rounder = fmod( old_x, G_Grid );
-			ModuleArray[i].coord[0] -= rounder;							//X coordinate down to grid
-			if( rounder > G_Grid /2 ) ModuleArray[i].coord[0] += G_Grid  ;		//Round X coordinate up to grid
+        Params.projectfilename = projectfilename;      //Name of the PCB/project file
+        Params.projectpath= projectpath;               //Path to the PCB/project file
+		Params.TopPrepend = TopPrepend;				//The Top Prepend string
+		Params.BotPrepend = BotPrepend;				//The Bottom Prepend string
 
-			old_y = ModuleArray[i].coord[1];
-			rounder = fmod( old_y, G_Grid );
-			ModuleArray[i].coord[1] -= rounder;							//Y coordinate down to grid
-			if( rounder >= G_Grid /2 ) ModuleArray[i].coord[1] += G_Grid;		//Round Y coordinate up to grid
+		Params.topsortcode = SORTYFIRST + ASCENDINGFIRST + ASCENDINGSECOND;			//The Top sort code (left to right, etc.)
+		Params.bottomsortcode = SORTYFIRST + ASCENDINGFIRST + DESCENDINGSECOND;	//The Bottom sort code (left to right, etc.)
+		Params.topstartrefdes = 1;						//The starting top ref des
+		Params.bottomstartrefdes = 0;					//The starting bottom ref des
+		Params.sortonmodules = 1;						//Sort on modules/ref des
+		Params.grid = DEFAULT_GRID;					//The sort grid
+		Params.paramfilename = PARAMETERFILENAME;		//Where the parameters are stored.
 
-			fprintf(debughandle, "\n%d\t%c\t%s\t%.3f\t%.3f\t\t%.3f\t%.3f", i,
-				ModuleArray[i].layer, ModuleArray[i].RefDesString,
-					old_x, old_y, ModuleArray[i].coord[0], ModuleArray[i].coord[1] );
-		}
+		Params.loghandle = NULL;
+//		Params.log = LOGPLAN + LOGCHANGE + LOGCOORD;
 
-		fclose( debughandle );
+		ShowAndGetParameters( &Params );			//Show what you got and allow them to change
 
-		TopModules = CountTopModules( ModuleArray, Modules );			//How many modules on the top?
-		BottomModules = Modules - TopModules;
+		if( Params.grid < MINGRID ) Params.grid = MINGRID;	//Make sure sort grid is > 0
+		WriteParameterFile( &Params );				//Save these for later
 
-struct KiCadModule TopModuleArray[ TopModules ];						//Allocate memory for the top side ModuleArray
-struct KiCadModule BottomModuleArray[ BottomModules ];					//Allocate memory for the bottom side ModuleArray
+		Params.errcount = 0;						//Nothing wrong yet
+		RenumKiCadPCB( &Params );	//Do this
 
-		SplitTopBottom( Modules, TopModules, ModuleArray, TopModuleArray, BottomModuleArray  );		//Create separate top and bottom array
+		gettimeofday( &Params.EndTime, NULL );				//Get the start time
+		printf("\nRun time of %10.3f Seconds", (float) ((Params.EndTime.tv_sec - Params.StartTime.tv_sec ) +
+										((float)(Params.EndTime.tv_usec - Params.StartTime.tv_usec )/1000000.))) ;
 
-struct RefDes RefDesChangeArray[ Modules ]; 							//Allocate for changes array
-
-int		numrefdestypes = MakeRefDesTypesArray( RefDesChangeArray, ModuleArray, Modules );	//Go through and count the number of types of refdeses
-struct 	RefDes RefDesTypeArray[ numrefdestypes ];		 						//Allocate for refdes type array
-
-		MakeRefDesTypesArray( RefDesTypeArray, ModuleArray, Modules );			//Now fill up the array
-
-		debughandle = OpenDebugFile( path, G_InputFileName, "_change", ".txt", "Change List" );
-
-		fprintf( debughandle, "Reference Designator Change Plan for %s", G_InputFileName );
- 		fprintf( debughandle, "\nThere are %d types of reference designations", numrefdestypes );
-
-		for( i = 0; i < numrefdestypes; i++ )
-		{
-			if( i%8 == 0 ) fprintf( debughandle, "\n");
-			fprintf( debughandle, "%s\t", RefDesTypeArray[i].RefDesType );
-		}
-
-
-		if( TopModules != 0 )			//Only do if there are modules on the top
-		{
-			SetRefDesTypeStart( RefDesTypeArray, G_TopStartRefDes );					//Set to the starting top refdes
-			SortKiCadModules(  TopModuleArray, TopModules, G_TopSortCode);
-			MakeRefDesChangeArray( TopModuleArray, RefDesTypeArray, RefDesChangeArray,
-						TopModules, G_TopPrepend, debughandle, "\nFront Side Changes" );
-		}
-
-		if( BottomModules != 0 )		//Only do if there are modules on the bottom
-		{
-			SetRefDesTypeStart( RefDesTypeArray, G_BottomStartRefDes );					//Set to the starting bottom refdes
-			SortKiCadModules(  BottomModuleArray, BottomModules, G_BottomSortCode ); //Now sort the bottom modules
-
-			MakeRefDesChangeArray( BottomModuleArray, RefDesTypeArray, &RefDesChangeArray[TopModules],
-						BottomModules, G_BottomPrepend, debughandle, "\n\nBack Side Changes" );
-		}
-
-		fclose( debughandle );
-/*
- * Note that the PCB file is already in memory
- */
-		UpdatePCBFileRefDes( path, G_InputFileName, Modules, RefDesChangeArray, buffer );		//Update the PCBs and the nets
-
-		free( buffer );							//Free up that memory for the next step
-		G_Buffer = NULL;						//And remember you did
-
-		printf("\n\nTraversing schematic hierarchy starting with %s", G_InputFileName );
-		UpDateSchematicHierarchy( path, G_InputFileName, Modules, RefDesChangeArray );				//Crawl through the design and update each schematic
-		printf("\n\n");
-
-		for( i = 0; i < Modules; i++ )
-			if(( RefDesChangeArray[i].Found == 0 ) && ( RefDesChangeArray[i].OldRefDes != SKIPREFDES ))
-				printf("\nWarning PCB component %s not found in schematic!", RefDesChangeArray[i].OldRefDesString  );
-
-		printf("\n\nDone\n");
+		printf("\nDone\n");
 		FreeMemoryAndExit( EXIT_SUCCESS );
 		return( ERRINVALIDEXIT );
-}//Main()
+}	//main()
+
+//
+//
+//  Renumber the PCB and backannotate the schematic and netlist (if present)
+//
+//
+int 	RenumKiCadPCB( struct RenumParams *Params )
+{
+int		i;
+//
+// First thing I want to do is create a list of schematics in the project
+//
+		if( 0 != Params->log )              //If making a log file
+		{
+char    outfilename[ MAXPATH ];
+
+		    MakeFileName( outfilename, Params->projectpath, "renum_logfile", ".txt" );  //Make the debug file name
+		    Params->loghandle = fopen ( outfilename,"wb");
+
+		    if ( Params->loghandle == NULL)                     //Not found
+		           RenumError("Can't open  file!", FILENOTFOUND );     //I am out of here
+		    fprintf(Params->loghandle, "RenumKicadPCB Log File\n");
+		}
+
+		Params->NumberOfSheets = 1;
+		CrawlSheets( Params->projectpath, Params->projectfilename, NULL, &Params->NumberOfSheets );		//Get the number of sheets in the schematic
+
+struct	KiCadFileInMemory FileList[ Params->NumberOfSheets + 5 ];								//Room for each schematic sheet, PCB, netlist
+		ClearKiCadFileInMemoryStruct( FileList, Params->NumberOfSheets + 4 );
+//
+//FileList[0] is reserved for the PCB
+//FileList[1] is reserved for the Netlist
+//FileList[2 ...] are the schematic sheets
+//
+		Params->NumberOfSheets = 1;
+		CrawlSheets( Params->projectpath, Params->projectfilename, &FileList[2], &Params->NumberOfSheets );	//Get the number and total storage of the sheets
+		printf("\nThere are %d unique sheets in the schematic.", Params->NumberOfSheets  );
+//
+//Now I know the names and sizes of the schematics in the project. The sizes are adjusted for component substitution
+//
+		MakeFileName( FileList[0].filename, Params->projectpath, Params->projectfilename, ".kicad_pcb" );				//Make the full file name
+		Params->pcbbuffer = LoadFile( FileList[0].filename, &(FileList[0].maxfilesize) );		//Load this file and extension, get file size
+//
+// Adjust the output file size for the .kicad_pcb file
+//
+		FileList[0].maxfilesize += (2 * MAXREFDES * ((CountStrings( Params->pcbbuffer,
+						"fp_text reference" ) 											//How many text reference fields
+								+ CountStrings( Params->pcbbuffer, "\"Net-(") )));					//How many nets in this PCB
+//
+		Params->Modules = GetModuleCount( Params->pcbbuffer );						//Extract the (modules field
+struct 	KiCadModule ModuleArray[ Params->Modules + 1];								//Allocate memory for the ModuleArray
+		Params->ModuleArray = ModuleArray;
+		LoadModuleArray( Params );							 						//Load up the module array
+
+		RoundToGrid( Params );
+
+		Params->TopModules = CountModules( ModuleArray, Params->Modules, 'F' );			//How many modules on the top?
+		Params->BottomModules = CountModules( ModuleArray, Params->Modules, 'B' );			//How many modules on the top?
+		if(( Params->BottomModules + Params->TopModules ) != Params->Modules )
+			RenumError("Error: module layer setup problem: check top and bottom layer definition",
+					TOPBOTTOMDEFINITIONERROR );		//I am out of here
+
+struct 	KiCadModule TopModuleArray[ Params->TopModules + 1 ];					//Allocate memory for the top side ModuleArray
+struct 	KiCadModule BottomModuleArray[ Params->BottomModules + 1 ];				//Allocate memory for the bottom side ModuleArray
+
+		Params->TopModuleArray = TopModuleArray;
+		Params->BottomModuleArray = BottomModuleArray;
+		SplitTopBottom( Params );		//Create separate top and bottom array
+
+struct 	RefDes RefDesChangeArray[ Params->Modules + 1 ]; 						//Allocate for changes array
+		Params->RefDesChangeArray = RefDesChangeArray;
+		MakeRefDesTypesArray( Params, 'C' );									//Go through and count the number of types of refdeses
+
+struct 	RefDes RefDesTypeArray[ Params->NumRefDesTypes + 1 ];			 		//Allocate for refdes type array
+		Params->RefDesTypeArray = RefDesTypeArray;
+		MakeRefDesTypesArray( Params, 'F'  );									//Now fill up the array
+//
+// Now make the change plan and related file
+//
+		if( 0 != (Params->log & LOGPLAN))
+		{
+		    fprintf( Params->loghandle, "\n\nReference Designator Change Plan for \n     %s", Params->projectfilename );
+		    fprintf( Params->loghandle, "\n\nThere are %d types of reference designations", Params->NumRefDesTypes );
+		    for( i = 0; i < Params->NumRefDesTypes; i++ )
+		    {
+		        if( 0 == i%8 ) fprintf( Params->loghandle, "\n" );              //On a new line
+		        LineItUp( Params, RefDesTypeArray[i].RefDesType, 10 );            //Pad spaces
+		    }
+		}
+
+		if( Params->TopModules != 0 )			//Only do if there are modules on the top
+			SortSide( Params, 'F');
+
+		if( Params->BottomModules != 0 )		//Only do if there are modules on the bottom
+			SortSide( Params, 'B');
+/*
+ * Note that the PCB file is already in memory @buffer
+ */
+		UpdatePCBFileRefDes( Params, &FileList[0] );							//Update the PCBs and the nets (all done in memory
+		printf("\n\nUpdating %s", FileList[0].filename );						//Put this here to separate from log files
+//
+		for( i = 0; i < Params->NumberOfSheets; i++)
+		{
+			UpdateSchematicFileRefDes( Params, &FileList[ i + 2] );
+			printf("\nUpdating Sheet #%d %s ", i, FileList[i+2].filename );		//Put this here to separate from log files
+		}
+
+		for( i = 0; i < Params->Modules; i++ )
+			if(( RefDesChangeArray[i].Found == 0 ) && ( RefDesChangeArray[i].OldRefDesNum != SKIPREFDES ))
+			{	printf("\nWarning PCB component %s not found in schematic!", RefDesChangeArray[i].OldRefDesString  );
+				++Params->errcount;
+			}
+
+		UpdateNetlistRefDes( Params, &FileList[1] );							//Now update the netlist names
+		if( FileList[1].filebuffer != NULL ) printf("\nUpdating %s", FileList[1].filename );
+//
+// All the file processing is done. If there are errors, ask to commit.
+//		If no errors or OK to commit, create backup files for all the file names and write out the new files
+//
+		if( 0 != Params->errcount )		//If there were errors
+		{
+			printf("\n**** Warning: %d errors in files ****\n				/"
+					"\n**** Proceed to write files despite errors (backups will be made)? (Y/N)?", Params->errcount );
+			i = toupper( mygetch());			//Get the reply
+			if( i == 'Y' ) Params->errcount = 0;
+		}
+
+		if( 0 == Params->errcount)		//If no errors or decides to commit
+		{
+			printf("\n\nMaking backups ... ");
+			i = 0;
+			printf("\n\nWriting files ... ");
+
+			for( i = 0; i < (Params->NumberOfSheets + 4); i++)
+			if( FileList[i].filename[0] != '\0')					//Just in case no netlist file
+			{
+				if( MakeBackupFile( FileList[i].filename ) != 0 )
+					printf("\n   Can't create backup file for %s", FileList[i].filename );
+				else if( FlushFile( &FileList[i] ) != 0 )
+					printf("\n   Can't write %s", FileList[i].filename );
+			}
+		}
+
+		if( NULL != Params->loghandle ) fclose( Params->loghandle );
+		for( i = 0; i < (Params->NumberOfSheets + 2); i++)		//One for PCB, one for Netlist, then x for sheets
+			if( FileList[ i ].filebuffer != NULL ) free(FileList[ i ].filebuffer );
+		return(0);
+}//RenumKiCadPCB
+
+//
+// Write out the file stored in memory. Ret NZ if error
+//
+
+int	FlushFile( struct KiCadFileInMemory *FileList )
+{
+int	retval;
+FILE	*handle = fopen ( FileList->filename,"wb");
+		printf("\nWrite %s", FileList->filename );
+		if( NULL == handle ) return( 1 );
+		retval = ( fwrite( FileList->filebuffer, sizeof(char), FileList->maxfilesize, handle ) != FileList->maxfilesize ? 2 : 0 );
+		fclose( handle );
+		return( retval );
+}
+
 
 /*
  * This is where we usually leave: ensures the memory is freed up
  */
 void	FreeMemoryAndExit( int code )
 {
-	if( G_Buffer != NULL ) free( G_Buffer );									//Free all memory
-	gettimeofday( &G_EndTime, NULL );				//Get the start time
-	printf("\nRun time of %10.3f Seconds", (float) ((G_EndTime.tv_sec - G_StartTime.tv_sec ) + ((float)(G_EndTime.tv_usec - G_StartTime.tv_usec )/1000000.))) ;
 	printf("\n\nHit any key to exit ");
 	mygetch();
 	printf("\n\n");
 	exit( code );
 }
 
-/*
+/*,
  * Common error exist routine
  */
 void	RenumError( char *message, int code )
 {
 	printf("\n%s", message );					//Say the word
-	if( G_WriteFile != NULL )
-		fclose( G_WriteFile );						//Write file handle
 	FreeMemoryAndExit( code );					//ByeBye
 }
+
+/*
+ * Case insensitive strstr
+ */
+char *strcasestr(const char *s, const char *find)
+{
+    char c, sc;
+    size_t len;
+    if ((c = *find++) != 0) {
+        c = (char)tolower((unsigned char)c);
+        len = strlen(find);
+        do {
+            do {
+                if ((sc = *s++) == 0)
+                    return (NULL);
+            } while ((char)tolower((unsigned char)sc) != c);
+        } while (strncasecmp(s, find, len) != 0);
+        s--;
+    }
+    return ((char *)s);
+}
+
 /*
  * A safe version of strcpy which no overwrite
  */
@@ -506,112 +593,62 @@ int		destlen = strlen( dest );
 			while( srclen-- >= 0 ) *dest++ = *source++;	//And concatenate
 }
 
+
 //
 // Make a backupfile by renaming the oldfile
 //
+// Enter with an filename (with or without extension), path to the file, and the extension
+//
 
-int		MakeBackupFile( char *path, char *filename, char *extension )
+int		MakeBackupFile( char *filename )
 {
-
-int		extsize = strlen( extension ) + sizeof( "RenumBack") + 2;
-int		filesize = strlen( path) + strlen( filename ) + extsize ;
-char	newfilename[ filesize ];
-char	oldfilename[ filesize ];
-char	tmpextension[ extsize ];			//Temporary extension
-
-		SafeStringCopy( tmpextension, "RenumBack", extsize ); 					//Backup text
-		SafeStringConcatinate( tmpextension, extension, extsize ); 				//And the file extension
-		MakeFileName( newfilename, path, filename, tmpextension, filesize );
+char	newfilename[ MAXPATH ];			//what the remaned file will be (.ext_RenumBak)
+		strcpy( newfilename, filename );
+		strcat( newfilename, "_RenumBack");
 		remove( newfilename );
-
-		MakeFileName( oldfilename, path, filename, extension, filesize );
-		return( rename( oldfilename, newfilename ));
-}
-
-/*
- * Extract the path from the file name
- * i.e. path ends up with C:/ etc if present
- *
- */
-void	ExtractPath( char *filename, char *path )
-{
-int	i, j = strlen( filename );
-int	lastslash = 0;
-
-		*path = '\0';									//Assume no path
-		for( i = 0; i < j; i++ )	//Find the last / or \ in the path
-			if(( filename[i] == '\\') || ( filename[i] == '/')) lastslash = i;
-
-		if( lastslash != 0 )			//If I have the path
-		{
-			for( i = 0; i <= lastslash; i++ ) path[i] = filename[i];	//Copy the path
-			path[i] = '\0';				//Zero terminate
-			SafeStringCopy( filename, filename + lastslash + 1, j ); //And copy the filename without the path
-		}
-
-		for( i = 0; i < j; i++ )	//Locate any "." indicating a file extension
-			if( filename[i] == '.') filename[i] = '\0';			//Trim off the file extension
-
-} //ExtractPath()
-
-/*
- * Make the full file name including the path and extension
- */
-void	MakeFileName( char *filename, char *path, char *fname, char *extension, int namesize )
-{
-	SafeStringCopy( filename, path, namesize );
-	SafeStringConcatinate( filename, fname, namesize );
-	SafeStringConcatinate( filename, extension, namesize );
-}
-
-//
-// Open a file for debugging (turns myproject filename into myproject_ftype.extension and opens
-// Returns the file handle
-//
-FILE	*OpenDebugFile( char *path, char *filename, char *ftype, char *extension, char *prompt )
-{
-int		namesize = strlen( path ) + strlen( G_InputFileName ) + 100;
-char	outfilename[ namesize ];
-char	infilename[ namesize ];			//make the filename and extension
-
-		SafeStringCopy( infilename, G_InputFileName, namesize );
-		SafeStringConcatinate( infilename, ftype, namesize );
-		MakeFileName( outfilename, path, infilename, extension, namesize );
-		printf("\nWriting %s file: %s", prompt, outfilename );
-
-FILE	*handle = fopen ( outfilename,"w");
-
-		if ( handle == NULL)						//Not found
-			RenumError("Can't open debug file!", FILENOTFOUND );		//I am out of here
-
-		return( handle );								//Open the file write only binary
+		return( rename( filename, newfilename ));
 }
 
 
 //
-// Open the file and load it into memory
-// Return the pointer to the buffer. Exit if file not found
+//  Make a file name with the path, filename, extension
+//  This trims any path from the filename before copying it
 //
-char	*LoadFile( char *path, char *fname, char *extension )
+void    MakeFileName( char *dest, char *path, char *filename, char *extension )
+{
+char    *lastslash = strrchr( filename , SLASHCHR );     //Path ends with the first slash from the right
+
+        lastslash = ( lastslash == NULL ? filename : lastslash + 1 );   //if no slash then the
+        strcpy( dest, path );                   //Get the path
+        strcat( dest, lastslash );               //Use this file name
+        strcat( dest, extension );              //And add this extension
+}
+
+//
+//	Assumes the file name has the full path
+//
+char	*LoadFile( char *filename, long *sizepoint )
 {
 long 	filesize, readbytes;
-
-int		namesize = strlen( path ) + strlen( fname ) + strlen( extension ) + 10;
-char	filename[ namesize ];			//make the filename and extension
 char	*buffer;
 
-	MakeFileName( filename, path, fname, extension, namesize );
+FILE	*readhandle = fopen ( filename,"rb");						//Open the file read only binary
 
-FILE	*readhandle = fopen ( filename,"rb");				//Open the file read only binary
-	if (readhandle == NULL)						//Not found
-		RenumError("File not found!", FILENOTFOUND );		//I am out of here
+	if (readhandle == NULL)											//Not found
+	{
+		printf("\nLoading %s ", filename  );
+		RenumError("LoadFile: File not found!", FILENOTFOUND );		//I am out of here
+	}
 
-	fseek(readhandle, 0L, SEEK_END);				//Go to the end of the file
+	fseek(readhandle, 0L, SEEK_END);								//Go to the end of the file
 	filesize = sizeof(char) * (ftell( readhandle ));				//Where am I?
-	fseek(readhandle, 0L, SEEK_SET);				//Go to the start of the file
 
-	buffer = (char*) malloc ((sizeof(char) * filesize ) + 1); 	 	// allocate memory to contain the whole file plus a '\0'
-	G_Buffer = buffer;										//Remember so the memory can be freed()
+	if(sizepoint != NULL )
+		*sizepoint = filesize;										//Needed for certain functions.
+
+	fseek(readhandle, 0L, SEEK_SET);								//Go to the start of the file
+
+	buffer = (char*) calloc ( filesize + 1, sizeof(char)); 	 	// allocate memory to contain the whole file plus a '\0'
 
 	if ( buffer == NULL)
 		RenumError("Can't allocate memory for file!", MALLOCERROR );		//I am out of here
@@ -623,13 +660,11 @@ int	feo = feof( readhandle );
 
 	fclose( readhandle );
 
-
 	if( readbytes != filesize )
 	{
 		printf("\nRead %ld, filesize %ld, FERROR %d, FEOF %d", readbytes, filesize, fer, feo );
 		RenumError("Read error!", READERROR );		//I am out of here
 	}
-	buffer[filesize] = '\0';					//ends with a null
 	return( buffer );
 }	//LoadFile()
 
@@ -671,15 +706,18 @@ int		modules = 0;
 
 
 /*
+ * 		LoadModuleArray( ModuleArray, Modules, Params->pcbbuffer ); 				//Load up the module array
+		LoadModuleArray( ModuleArray, Modules, Params );	 						//Load up the module array
+ *
  * Scan the PCB file in memory and fill in the Module Array
  */
-int		LoadModuleArray( struct KiCadModule *ModuleArray, int modules, char *buffer ) 		//Load up the module array
+
+void	LoadModuleArray( struct RenumParams *Params ) 		//Load up the module array
 {
 char	*found, *nextmodule, *txtfound, *atfound;				//Where the next module is
 char	workbuffer[2*MAXREFDES+1];		//Where the strings go for now
 char	*anglepnt;
 
-int 	i = 0, j;						//And what the RefDes is (i.e. 23)
 float	ModXCoordinate, ModYCoordinate;				//What the X and Y Coordinate of the module is
 float	modangle, sinmodangle, cosmodangle;
 
@@ -690,69 +728,195 @@ float	modangle, sinmodangle, cosmodangle;
  * The tricky bit is that the text reference coordinates are relative to the module, so I get the module X, Y, then add the
  * text reference to XY to that
  */
-	found = buffer;								//Got to start somewhere
-	do
-	{
-		found = strstr( found, "(module ");		//Find the "(module " token
-		if( found != NULL )
-		{
-			found += sizeof("(module")/sizeof(char);			//Skip this
-			nextmodule = strstr( found, "(module ");			//Use this to find where the next module starts
+char    layer;
+char	FrontLayerString[MAXREFDES];		//Room for the front layer name (Kicad is 20 chars)
+char	BackLayerString[MAXREFDES];			//Room for the back layer name (Kicad is 20 chars)
+char    *frontstringpnt = FrontLayerString;
 
-			found = FindAndSkip( workbuffer, found, "(layer ", nextmodule );	//get the layer of the refdes
-			ModuleArray[i].layer = workbuffer[0];
+char	TMPLayerString[MAXREFDES];			//Scratch
+int		FrontModuleCount = 0;
+int		BackModuleCount = 0;
+
+		FrontLayerString[0] = 0;		//Start with nothing
+		BackLayerString[0] = 0;
+//
+// Fix wrong top layers bug
+//  (layers
+//	    (0 F.Cu signal)
+//
+        found = strstr( Params->pcbbuffer, "(layers");          //Find the "(layers" token
+        found = strstr( found + sizeof("layers"), "(0 " ) + sizeof("(0");       //Find the (0 (next is front layer string)
+        while( *found != ' ') *frontstringpnt++ = *found++;
+        *frontstringpnt = '\0';
+
+int     ModuleCount = 0, j;                       //And what the RefDes is (i.e. 23)
+
+        do
+        {
+            found = strstr( found, "(module ");		//Find the "(module " token
+            if( found != NULL )
+            {
+                found += sizeof("(module")/sizeof(char);			//Skip this
+                nextmodule = strstr( found, "(module ");			//Use this to find where the next module starts
+                found = FindAndSkip( workbuffer, found, "(layer ", nextmodule );	//get the layer of the refdes
+
+			CopyText( TMPLayerString, workbuffer, sizeof(TMPLayerString) );		//Get the layer name
+
+			layer = 0;
+			if( strcmp( FrontLayerString, TMPLayerString ) == 0 )				//This is the front string
+				layer = 'F';
+			else if( strcmp( BackLayerString, TMPLayerString ) == 0 )
+			    layer = 'B';
+
+			else if( BackLayerString[0] == 0 )
+			{
+			    CopyText( BackLayerString, TMPLayerString, sizeof(FrontLayerString) );		//Get the layer name for front layer
+				layer = 'B';												//This module is on the back layer
+			}
+
+			if( 0 == layer )
+			{
+			    printf("F %s, B %s, T %s", FrontLayerString, BackLayerString, TMPLayerString );
+							RenumError("Error: More than 2 module layers",
+									TOOMANYMODULELAYERS );		//I am out of here
+			}
+
+			Params->ModuleArray[ ModuleCount ].layer = layer;
+			if( layer == 'F') ++FrontModuleCount; else ++BackModuleCount;
 
 			found = FindAndSkip( workbuffer, found, "(at ", nextmodule );
 
-			anglepnt = GetFloatFromString( &ModuleArray[i].coord[1], GetFloatFromString( &ModuleArray[i].coord[0], workbuffer ) );
+			anglepnt = GetFloatFromString( &Params->ModuleArray[ModuleCount].coord[1],
+			                               GetFloatFromString( &Params->ModuleArray[ModuleCount].coord[0], workbuffer ) );
 			GetFloatFromString( &modangle, anglepnt );
 
 			found = FindAndSkip( workbuffer, found, "(fp_text reference ", nextmodule );	//Find the reference designator
 
-			txtfound = CopyText( ModuleArray[i].RefDesType, workbuffer );					//Copy the text part of the refdes
-			ModuleArray[i].RefDes = atoi( txtfound );
+			txtfound = CopyText( Params->ModuleArray[ModuleCount].RefDesType,
+			                             workbuffer, sizeof(Params->ModuleArray[ModuleCount].RefDesType )); //Copy the text part of the refdes
+			Params->ModuleArray[ModuleCount].RefDesNum = atoi( txtfound );
 
 			j = 0;
 			while(( workbuffer[j] != ' ' ) && ( j < MAXREFDES ))
 			{
-				ModuleArray[i].RefDesString[j] = workbuffer[j];
+				Params->ModuleArray[ModuleCount].RefDesString[j] = workbuffer[j];
 				j++;
 			}
-			ModuleArray[i].RefDesString[j] = '\0';
+			Params->ModuleArray[ModuleCount].RefDesString[j] = '\0';
 
-			if(( ModuleArray[i].RefDesString[j-1] < '0' ) ||  ( ModuleArray[i].RefDesString[j-1] > '9' )) //If it doesn't end with a number (i.e. *
-				ModuleArray[i].RefDes = SKIPREFDES;					//Skip it
+			if(( Params->ModuleArray[ModuleCount].RefDesString[j-1] < '0' ) ||
+			                ( Params->ModuleArray[ModuleCount].RefDesString[j-1] > '9' )) //If it doesn't end with a number (i.e. *
+				Params->ModuleArray[ModuleCount].RefDesNum = SKIPREFDES;					//Skip it
 
 			atfound = strstr( workbuffer, "(at ");
 			if( atfound  == NULL )
-			{	snprintf( G_ERRSTR, MAXSTRING, "Error: Missing coordinates for module %s%d", ModuleArray[i].RefDesType, ModuleArray[i].RefDes  );
+			{	snprintf( G_ERRSTR, MAXSTRING, "Error: Missing coordinates for module %s%d",
+			 	          Params->ModuleArray[ModuleCount].RefDesType, Params->ModuleArray[ModuleCount].RefDesNum  );
 				RenumError( G_ERRSTR, ERRNOCOORD );
 			}
 
 			GetFloatFromString( &ModYCoordinate, GetFloatFromString( &ModXCoordinate, atfound + sizeof("(at")));
-//
-//			anglepnt = GetFloatFromString( &ModYCoordinate, GetFloatFromString( &ModXCoordinate, atfound + sizeof("(at")));
-//			GetFloatFromString( &refangle, anglepnt );
-//
-			if( G_SortOnModules == 0 )						//Only if sorting by reference designator coordinate
+			if( Params->sortonmodules == 0 )						//Only if sorting by reference designator coordinate
 			{
 				modangle = modangle * ( 3.14159265 / 180.0 );	//Convert angle to radians
 				sinmodangle = sin( modangle  );				//Find the sine of the module angle
 				cosmodangle = cos( modangle  );				//Find the sine of the module angle
-				ModuleArray[i].coord[0] += (( ModXCoordinate * cosmodangle )  + ( ModYCoordinate * sinmodangle ));	//Save the coordinate (done for clarity
-				ModuleArray[i].coord[1] += (( -ModXCoordinate * sinmodangle )  + ( ModYCoordinate * cosmodangle ));
+				Params->ModuleArray[ModuleCount].coord[0] +=
+				        (( ModXCoordinate * cosmodangle )  + ( ModYCoordinate * sinmodangle ));	//Save the coordinate (done for clarity
+				Params->ModuleArray[ModuleCount].coord[1] +=
+				        (( -ModXCoordinate * sinmodangle )  + ( ModYCoordinate * cosmodangle ));
 			}
-			ModuleArray[i].index = i;
-			i++;
+			Params->ModuleArray[ModuleCount].index = ModuleCount;
+			ModuleCount++;
 		}
 	}while( found != NULL );
 
-	if( i != modules )
+	if( ModuleCount != Params->Modules )
 		RenumError( "\nError: PCB modules does not match declaration", MODULEMISSMATCH );
 
-	return( modules );
+	printf("There are %d modules on layer: %s\n", FrontModuleCount, FrontLayerString );
+	if(BackModuleCount != 0 )
+		printf("There are %d modules on layer: %s\n", BackModuleCount, BackLayerString );
+
 }
 
+//
+//  Routines to make nice with tabs
+//
+void    FloatNumberAlign( struct RenumParams *Params, float afloat, int tab  )
+{
+char    tmpstr[10];
+        sprintf( tmpstr, "%.3f", afloat );
+        LineItUp( Params, tmpstr, 10  );
+}
+
+void    NewLineNumber( struct RenumParams *Params, int linenum, int tab  )
+{
+char    tmpstr[20];
+        sprintf( tmpstr, "\n#%d", linenum );
+        LineItUp( Params, tmpstr, 10  );
+}
+//
+//  Make nice with tabs
+//
+void    LineItUp( struct RenumParams *Params, char *text, int tab  )
+{
+char    outstr[ strlen( text) + tab + 2 ];
+int     i = strlen( text );              //Start here
+        strcpy( outstr, text );         //start with the text
+
+        while( 0 != i%tab) outstr[i++] = ' ';
+        outstr[i] = '\0';
+        fprintf( Params->loghandle, "%s", outstr );
+}
+
+//
+//
+//	Round to a sort grid (can make more sense sorting slightly off position modules.
+//
+void	RoundToGrid( struct RenumParams *Params )
+{
+int		i;
+float	rounder, old_x, old_y;
+
+char    tmpstr[5]; //scratch
+
+struct KiCadModule *ModuleArray = Params->ModuleArray;
+
+        if( 0 != (Params->log & LOGCOORD))
+            fprintf(Params->loghandle, "*********** Sort on %s Coordinates *******************",
+			        ( Params->sortonmodules == 0 ? "Ref Des" : "Module" ));
+//
+// Round the Module Array to the grid (only do this once)
+//
+		for( i = 0; i < Params->Modules; i++ )
+		{
+			old_x = ModuleArray[i].coord[0];
+			rounder = fmod( old_x, Params->grid);
+			ModuleArray[i].coord[0] -= rounder;							//X coordinate down to grid
+			if( rounder > ( Params->grid/2 )) ModuleArray[i].coord[0] += Params->grid  ;		//Round X coordinate up to grid
+
+			old_y = ModuleArray[i].coord[1];
+			rounder = fmod( old_y, Params->grid );
+			ModuleArray[i].coord[1] -= rounder;							//Y coordinate down to grid
+			if( rounder >= ( Params->grid /2 )) ModuleArray[i].coord[1] += Params->grid;		//Round Y coordinate up to grid
+
+	        if( 0 != (Params->log & LOGCOORD))
+	        {
+	            NewLineNumber(Params, i, 5 );
+	            tmpstr[0] = ModuleArray[i].layer;           //Layer
+	            tmpstr[1] = '\0';
+                LineItUp( Params, tmpstr, 4  );
+                LineItUp( Params, ModuleArray[i].RefDesString, 16  );
+                FloatNumberAlign( Params, old_x, 10 );
+                FloatNumberAlign( Params, old_y, 20 );
+                FloatNumberAlign( Params, ModuleArray[i].coord[0], 10 );
+                FloatNumberAlign( Params, ModuleArray[i].coord[1], 10 );
+	        }
+		}
+//LineItUp( Params, char *text, 10  )
+
+} //RoundToGrid
 
 /*
  * Find the instr in the buffer only if less than limit (ignore limit if NULL)
@@ -761,6 +925,7 @@ float	modangle, sinmodangle, cosmodangle;
  *
  * return NULL if not found
  */
+
 char	*FindAndSkip( char *dest, char *buffer, char *instr, char *limit )
 {
 char	*found;
@@ -783,11 +948,13 @@ int		i;
 
 
 /*
- * Copy only the text part of a string return pointer to non-alpha
+ * Copy only the text part of a string return pointer to non-alpha, non-space, printable
  */
-char	*CopyText( char *dest, char *source )		//Copy the text part
+char	*CopyText( char *dest, char *source, int size )		//Copy the text part
 {
-	while( isalpha( (int) *source ) != 0 )			//Until a non-character
+	while((( 0 != isalpha( (int) *source )                      //As long as a letter
+	        || (( 0 != ispunct((int) *source ) && ( ' ' != *source ))   //Or a non-space punctuation.
+	              && (size-- > 0 )))))			//Until the end
 		*dest++ = *source++;					//Copy
 	*dest = '\0';								//Zero terminate the destination string
 	return( source );
@@ -864,7 +1031,7 @@ int	i;
 		dest->coord[1] = source->coord[1];					//Copy Y  coordinate
 		SafeStringCopy( dest->RefDesString, source->RefDesString, MAXREFDES );		//What the RefDes Preamble is (i.e. U, R VR, etc.)
 		SafeStringCopy( dest->RefDesType, source->RefDesType, MAXREFDES );		//What the RefDes Preamble is (i.e. U, R VR, etc.)
-		dest->RefDes = source->RefDes;						//What the RefDes is (i.e. 23)
+		dest->RefDesNum = source->RefDesNum;						//What the RefDes is (i.e. 23)
 		dest->index = source->index;						//And the index (used for sort)
 		source++;
 		dest++;
@@ -884,23 +1051,39 @@ void	CopyKiCadModuleArrayElement( struct KiCadModule *dest, struct KiCadModule *
 		dest->coord[1] = source->coord[1];					//Copy Y  coordinate
 		SafeStringCopy( dest->RefDesString, source->RefDesString, MAXREFDES );		//What the RefDes Preamble is (i.e. U, R VR, etc.)
 		SafeStringCopy( dest->RefDesType, source->RefDesType, MAXREFDES );		//What the RefDes Preamble is (i.e. U, R VR, etc.)
-		dest->RefDes = source->RefDes;						//What the RefDes is (i.e. 23)
+		dest->RefDesNum = source->RefDesNum; 				//What the RefDes is (i.e. 23)
 		dest->index = source->index;						//And the index (used for sort)
 }
+
+//
+// Front and back side sorts and changes require different parameters.
+// Do front if Side == 'F' else do back
+//
+void	SortSide( struct RenumParams *Params, char Side )
+{
+			SetRefDesTypeStart( Params, Side );						//Set to the starting top refdes
+			SortKiCadModules( Params, Side);						//Sort this side
+			MakeRefDesChangeArray( Params, Side);		//Make the change array
+}
+
+
 
 /*
  * This allow arbitrary starting refdes
  * It is mostly useful if you have a prepend (i.e B_R1)
  *
  */
-void	SetRefDesTypeStart( struct RefDes *typesarray, int startrefdes )					//Set to the starting top refdes
+void	SetRefDesTypeStart( struct RenumParams *Params, char Side )					//Set to the starting top refdes
 {
 int		i = 0;
+int		startrefdes = ( 'F' == Side ? Params->topstartrefdes : Params->bottomstartrefdes );
+
+struct RefDes *typesarray = Params->RefDesTypeArray;
 
 	if( startrefdes == 0 ) return;							//Nothing to do
 
 	while(typesarray[i].RefDesType[0] != '\0')			  	//Until the end
-		typesarray[i++].NewRefDes = startrefdes;				//Set the starting point
+		typesarray[i++].NewRefDesNum = startrefdes;				//Set the starting point
 }
 
 /*
@@ -909,27 +1092,32 @@ int		i = 0;
  *	Returns the number of reference designator types
  */
 
-int		MakeRefDesTypesArray( struct RefDes *outarray, struct KiCadModule *ModuleArray, int modules )
+
+void	MakeRefDesTypesArray( struct RenumParams *Params, char CountOrFill )
 {
-int	i, j, found, numrefdes = 0;
+int	i, j, found;
+
+struct RefDes *outarray = (( 'C' == CountOrFill ? Params->RefDesChangeArray : Params->RefDesTypeArray ));	//Use change as scratch to count;
 
 	outarray[0].RefDesType[0] = '\0';			//Zap the refdes string
+	Params->NumRefDesTypes = 0;
 
-	for( i = 0; i < modules; i++) {
+	for( i = 0; i < Params->Modules; i++)
+	{
 		found = 0;								//Assume not found
-		for( j = 0; j < numrefdes; j++ )
-			if( strcmp( ModuleArray[i].RefDesType, outarray[j].RefDesType ) == 0 )
+		for( j = 0; j < Params->NumRefDesTypes; j++ )
+			if( strcmp( Params->ModuleArray[i].RefDesType, outarray[j].RefDesType ) == 0 )
 				found = 1;
 
 		if( found == 0 )				//Not found in the table so insert it
 		{
-			SafeStringCopy( outarray[j].RefDesType, ModuleArray[i].RefDesType, MAXREFDES );				//Copy it in
-			outarray[j].NewRefDes = 1;														//Start with a 1
-			numrefdes++;																//One more type of refdes
-			outarray[numrefdes].RefDesType[0] = '\0';									//Zap the string
+			SafeStringCopy( outarray[j].RefDesType, Params->ModuleArray[i].RefDesType, MAXREFDES );				//Copy it in
+			outarray[j].NewRefDesNum = 1;														//Start with a 1
+			Params->NumRefDesTypes++;																//One more type of refdes
+			outarray[Params->NumRefDesTypes].RefDesType[0] = '\0';									//Zap the string
 		}
 	}
-	return( numrefdes );
+	return;
 
 } //MakeRefDesTypesArray()
 
@@ -937,53 +1125,102 @@ int	i, j, found, numrefdes = 0;
  * Now create an array which has the refdes type, the old refdes and the new refdes
  * There is an optional prepend string which allows refdeses to be renamed (eg) T_ or  B_ so you get T_R21 and B_U2
  */
-void	MakeRefDesChangeArray( struct KiCadModule *modulearray, struct RefDes *refdestypesarray,
-					struct RefDes *refdeschangecrray, int modules, char *prepend, FILE *debughandle, char *text )
 
+void	MakeRefDesChangeArray( struct RenumParams *Params, char Side )
 {
-int	i = 0, j, numrefdes = 0;
+int		i = 0, j;
+int 	errcnt = 0, blankcount = 0;
 
-	fprintf( debughandle, "\n\n%s ", text );
+struct 	KiCadModule *modulearray;
+struct 	RefDes *refdeschangearray;
+int 	modules;
+char 	*prepend;
 
-	while( refdestypesarray[i++].RefDesType[0] != '\0' )
-		numrefdes++;
+char    NewRefDes[MAXREFDES * 4 ];          //Save the new ref des
+
+int 	numrefdestypes = Params->NumRefDesTypes;
+
+	if( 'F' == Side )
+	{
+		modulearray = Params->TopModuleArray;
+		refdeschangearray = &Params->RefDesChangeArray[0];
+		modules = Params->TopModules;
+		prepend = Params->TopPrepend;
+	}
+	else
+	{
+		modulearray = Params->BottomModuleArray;
+		refdeschangearray = &Params->RefDesChangeArray[Params->TopModules];
+		modules = Params->BottomModules;
+		prepend = Params->BotPrepend;
+	}
+
+	if( 0 != (Params->log & LOGPLAN))
+	    fprintf( Params->loghandle, "\n\n%s Side Changes", (Side == 'F'? "Front" : "Back"));
 
 	for( i = 0; i < modules; i++)
 	{
-		for( j = 0; j < numrefdes; j++ )
+		if(( '\0' == modulearray[i].RefDesType[0] ) && ( 0 == blankcount ))
 		{
-			if( strcmp( modulearray[i].RefDesType, refdestypesarray[j].RefDesType ) == 0 )	//I found the type (U, R, VR, etc )
+			printf("\nWarning : zero length refdes on PCB %s !", ( 'F' == Side ? "Front" : "Back" ));
+			++blankcount;
+		}
+
+		for( j = 0; j < numrefdestypes; j++ )
+		{
+			if( strcmp( modulearray[i].RefDesType, Params->RefDesTypeArray[j].RefDesType ) == 0 )	//I found the type (U, R, VR, etc )
 			{
-				SafeStringCopy( refdeschangecrray[i].RefDesType, refdestypesarray[j].RefDesType, MAXREFDES ); //Copy the type (U, R, VR, etc)
-				SafeStringCopy( refdeschangecrray[i].OldRefDesString, modulearray[i].RefDesString, MAXREFDES ); //Copy the type (U, R, VR, etc)
-				refdeschangecrray[i].prepend = prepend;							//Know what to prepend to update
-				refdeschangecrray[i].OldRefDes = modulearray[i].RefDes;			//Get the old refdes
-				refdeschangecrray[i].NewRefDes = refdestypesarray[j].NewRefDes++;	//Show the new one and bump it
-				refdeschangecrray[i].Found = 0;									//Assume not found in the schematic
+				SafeStringCopy( refdeschangearray[i].RefDesType, Params->RefDesTypeArray[j].RefDesType, MAXREFDES ); //Copy the type (U, R, VR, etc)
+				SafeStringCopy( refdeschangearray[i].OldRefDesString, modulearray[i].RefDesString, MAXREFDES ); //Copy the type (U, R, VR, etc)
+				refdeschangearray[i].prepend = prepend;										//Know what to prepend to update
+				refdeschangearray[i].OldRefDesNum = modulearray[i].RefDesNum;						//Get the old refdes
+				refdeschangearray[i].NewRefDesNum = Params->RefDesTypeArray[j].NewRefDesNum++;	//Show the new one and bump it
+				refdeschangearray[i].Found = 0;												//Assume not found in the schematic
 
-				fprintf( debughandle, "\n#%d\t%s\t->\t", i, modulearray[i].RefDesString );
-				if(refdeschangecrray[i].OldRefDes == SKIPREFDES )			//If I ignore this one
-					fprintf( debughandle, "%s", refdeschangecrray[i].OldRefDesString );
+				if( 0 != (Params->log & LOGPLAN))
+				{
+	                NewLineNumber(Params, i, 5 );
+	                LineItUp( Params, modulearray[i].RefDesString, 16  );
+                    LineItUp( Params, "->", 8  );
+				}
+
+				if(refdeschangearray[i].OldRefDesNum == SKIPREFDES )			//If I ignore this one
+				    strcpy( NewRefDes, refdeschangearray[i].OldRefDesString );
 				else
-					fprintf( debughandle, "%s%d", modulearray[i].RefDesType, refdeschangecrray[i].NewRefDes );
+				    MakeNewRefDes( NewRefDes, &refdeschangearray[i] );
 
-				if(refdeschangecrray[i].OldRefDes == SKIPREFDES )
-						fprintf(debughandle, "\t*** will be ignored ***");
+				if( 0 != (Params->log & LOGPLAN))
+				{
+                    LineItUp( Params, NewRefDes, 16  );
+	                if(refdeschangearray[i].OldRefDesNum == SKIPREFDES )           //If I ignore this one
+	                    LineItUp( Params, "*** will be ignored ***", 2  );
+				}
+				break;
 			}
 		}
+
+		if(( j >= numrefdestypes ) && ( errcnt ++ < 10 ))	//Show max 10 error per sheetS
+		{
+			printf("\nError %i Refdes %s not found! ", errcnt, modulearray[i].RefDesType );
+			if( 0 != (Params->log & LOGPLAN))
+			    fprintf(Params->loghandle, "\nError %i Refdes %s not found! ", errcnt, modulearray[i].RefDesType );
+		}
 	}
+
+	Params->errcount += errcnt;
+
 } //MakeRefDesChangeArray
 
 /*
  * Count the number of top modules (also tells you bottom modules
  */
 
-int	CountTopModules( struct KiCadModule *ModuleArray,  int Modules )
+int	CountModules( struct KiCadModule *ModuleArray,  int Modules, char layer )
 {
 int	i, TopModules = 0;							//How many modules are on top and bottom side
 
 	for( i = 0; i < Modules; i++ )				//Scan through the ModuleArray and
-		if( ModuleArray[i].layer == 'F')		//Count the number on top
+		if( ModuleArray[i].layer == layer)		//Count the number on top
 			TopModules++;
 
 	return( TopModules );
@@ -994,229 +1231,227 @@ int	i, TopModules = 0;							//How many modules are on top and bottom side
  * return with the number of modules on top (because bottommodules = modules - topmodules )
  */
 
-int	SplitTopBottom( int Modules, int TopModules, struct KiCadModule *ModuleArray, struct KiCadModule *TopModuleArray, struct KiCadModule *BottomModuleArray  )
+//int	SplitTopBottom( int Modules, int TopModules, struct KiCadModule *ModuleArray, struct KiCadModule *TopModuleArray, struct KiCadModule *BottomModuleArray  )
+void	SplitTopBottom( struct RenumParams *Params )
 {
 int	i, j = 0, k = 0;
-int	BottomModules = Modules - TopModules;			//How many modules are on bottom side
 
-/*
- * Scan through to determine memory needs
- */
-	for( i = 0; i < Modules; i++ )								//Scan through the ModuleArray and
-		if( ModuleArray[i].layer == 'F')						//Count the number on top
-			CopyKiCadModuleArrayElement( &TopModuleArray[ j++], &ModuleArray[i], (float) 0.0 );
-		else if( ModuleArray[i].layer == 'B' )
-			CopyKiCadModuleArrayElement( &BottomModuleArray[ k++], &ModuleArray[i], ( float) 0.0 );
+	for( i = 0; i < Params->Modules; i++ )								//Scan through the ModuleArray and
+		if( Params->ModuleArray[i].layer == 'F') 						//Count the number on top
+			CopyKiCadModuleArrayElement( &Params->TopModuleArray[ j++], &Params->ModuleArray[i], (float) 0.0 );
+		else if( Params->ModuleArray[i].layer == 'B' )
+			CopyKiCadModuleArrayElement( &Params->BottomModuleArray[ k++], &Params->ModuleArray[i], ( float) 0.0 );
 
-	if(( BottomModules + TopModules ) != Modules )
-		printf("\nWarning: %d modules neither top nor bottom ",  Modules - (BottomModules + TopModules ));
+	if(( j + k ) != Params->Modules )
+		printf("\nWarning: %d modules neither top nor bottom ",  Params->Modules - (j + k ));
 
-	return( TopModules );
-}
+	Params->TopModules = j;
 
-/*
- * Skip whitespace and copy text until <= ' '
- */
-char	*nexttext( char *buffer, char *text )		//Get (and ignore) the (old) ref des
-{
-int i = 0;
-	while(( buffer[i] != '\0') && (buffer[i] <= ' '))		//Look for a space or less
-		if(buffer[i] == ' ') i++;							//Skip until a space
-
-int j = 0;
-	while(( j < MAXREFDES ) && ( buffer[i] != '\0') && (buffer[i] > ' ') && (buffer[i] != '"'))		//Look for a space or more
-		if(buffer[i] > ' ') text[j++] = buffer[i++];							//Skip until a space
-	text[j] = '\0';
-	return( buffer + i );
 }
 
 /*
  * This creates a KiCadModulearray terminated with index -1 from the ModuleArray
  * It sorts it by X ascending, then copies and sorts each X (row) by Y ascending
  */
+//void	SortKiCadModules( struct KiCadModule *modulearray, struct RenumParams *Params, int modules, int sortcode )
 
-void	SortKiCadModules( struct KiCadModule *modulearray, int modules, int sortcode )
+
+void	SortKiCadModules( struct RenumParams *Params, char Side )
 {
 int		i,	j, scanindex = 0, tmpindex;
 float	min, srcval;					//Assume board less than 10M wide
+
+struct KiCadModule *modulearray;
+int     modules;
+int     sortcode;
+
+		if( 'F' == Side )
+		{
+			modulearray = Params->TopModuleArray;
+			modules = Params->TopModules;
+			sortcode = Params->topsortcode;
+		}
+		else
+		{
+			modulearray = Params->BottomModuleArray;
+			modules = Params->BottomModules;
+			sortcode = Params->bottomsortcode;
+		}
+
 
 int		sortxy = ((( sortcode & SORTYFIRST ) == 0 ) ? SORTX : SORTY );
 int 	firstdirection = ((( sortcode & DESCENDINGFIRST ) == 0 ) ? ASCENDING : DESCENDING );
 int 	secondirection = ((( sortcode & DESCENDINGSECOND ) == 0 ) ? ASCENDING : DESCENDING );
 
-struct KiCadModule sortarray0[ modules + 1 ];		//Make a temporary array for x sort
-struct KiCadModule sortarray1[ modules + 1 ];		//Make a temporary array for y sort
+struct 	KiCadModule sortarray0[ modules + 1 ];		//Make a temporary array for x sort
+struct 	KiCadModule sortarray1[ modules + 1 ];		//Make a temporary array for y sort
 
-	CopyKiCadModuleArray( sortarray0, modulearray, modules, G_Grid );
-	sortarray0[modules].index = -1;							//End the array
-	SortOnXY( sortarray0, sortxy, firstdirection, G_Grid );	//Sort on the first order (x or y)
+		CopyKiCadModuleArray( sortarray0, modulearray, modules, Params->grid );
+		sortarray0[modules].index = -1;							//End the array
+		SortOnXY( sortarray0, sortxy, firstdirection, Params->grid );	//Sort on the first order (x or y)
 //
 // Now make another sort array copy, this time with the next order
 //
-	for( i = 0; i < modules; i++ )
-	{
-		j = sortarray0[i].index;							//The index gives the sequence for the destination
-		CopyKiCadModuleArrayElement( &sortarray1[i], &modulearray[j], G_Grid  );
-		sortarray1[i].index = j;
-	}
-
-	sortarray1[i].index = -1;										//End the array
-
-	while( scanindex <= modules )							//Do until the end
-	{
-		min = sortarray1[scanindex].coord[sortxy];			//Look for this X or Y
-		for( i = scanindex;  i <=  modules; i++)
+		for( i = 0; i < modules; i++ )
 		{
-			srcval = sortarray1[i].coord[sortxy];
+			j = sortarray0[i].index;							//The index gives the sequence for the destination
+			CopyKiCadModuleArrayElement( &sortarray1[i], &modulearray[j], Params->grid  );
+			sortarray1[i].index = j;
+		}
 
-			if((( firstdirection == ASCENDING ) && ( srcval > min ))  		//+/- the grid value
-				|| (( firstdirection == DESCENDING ) && ( srcval < min ))) 	//If descending the first go
+		sortarray1[i].index = -1;										//End the array
+
+		while( scanindex <= modules )							//Do until the end
+		{
+			min = sortarray1[scanindex].coord[sortxy];			//Look for this X or Y
+			for( i = scanindex;  i <=  modules; i++)
 			{
-				tmpindex = sortarray1[i].index;				//Save the place
-				sortarray1[i].index = -1;					//Put in a fake end
+				srcval = sortarray1[i].coord[sortxy];
 
-				SortOnXY( &sortarray1[scanindex], ( sortxy ^ 1), secondirection, G_Grid );
-				sortarray1[i].index = tmpindex;				//Reinstate the index
-				scanindex = i;								//Look from here next time
-				break;										//Get out of the for loop
-			}
+				if((( firstdirection == ASCENDING ) && ( srcval > min ))  		//+/- the grid value
+						|| (( firstdirection == DESCENDING ) && ( srcval < min ))) 	//If descending the first go
+				{
+					tmpindex = sortarray1[i].index;				//Save the place
+					sortarray1[i].index = -1;					//Put in a fake end
+
+					SortOnXY( &sortarray1[scanindex], ( sortxy ^ 1), secondirection, Params->grid );
+					sortarray1[i].index = tmpindex;				//Reinstate the index
+					scanindex = i;								//Look from here next time
+					break;										//Get out of the for loop
+				}
 			else if( sortarray1[i].index == -1 )			//the last row
 			{
-				SortOnXY( &sortarray1[scanindex], ( sortxy ^ 1), secondirection, G_Grid );			//Sort on Y coordinates from here
+				SortOnXY( &sortarray1[scanindex], ( sortxy ^ 1), secondirection, Params->grid );			//Sort on Y coordinates from here
 				scanindex = modules + 1;					//Break the while
 			}
 		}
 	}
-	CopyKiCadModuleArray( modulearray, sortarray1, modules, G_Grid );			//Copy the sorted array to the module array
-
+	CopyKiCadModuleArray( modulearray, sortarray1, modules, Params->grid );			//Copy the sorted array to the module array
 } //SortKiCadModules
 
 
-/*
- *	This function deal with updating the schematic in a hierarchy
- *	First it figures out the storage requirements recursively
- *	Then it prepares a list of unique schematic file names
- *	Then it walks through that list and updates each of them with the new reference designators
- *
- */
-
-void	UpDateSchematicHierarchy( char *path, char *fname, int modules, struct RefDes *RefDesChangeArray )
+void	ClearKiCadFileInMemoryStruct( struct KiCadFileInMemory *FileList, int NumberOfEntries )
 {
-int 	i, NumberOfSheets = 1;
-int		SheetNameSize =	strlen( fname ) + sizeof( ".sch") + 2;					//Start with at least this file
+int	i;
 
-char		RootFile[ SheetNameSize ];
-
-	SafeStringCopy( RootFile, fname, SheetNameSize );
-	SafeStringConcatinate( RootFile, ".sch", SheetNameSize );
-	CrawlSheets( path, RootFile, NULL, &NumberOfSheets, &SheetNameSize );	//Get the number and total storage of the sheets
-
-char	*SheetList[NumberOfSheets + 2];							//This array has pointers to the sheets
-char	SheetNameBuffer[ SheetNameSize ];						//And this has the actual sheet names
-
-	memset( SheetNameBuffer, 0, SheetNameSize / sizeof( char ));	//Make sure the names are all zeros
-	for( i = 0; i <= NumberOfSheets + 2; i++ ) SheetList[i] = NULL;	//Fill up the pointers
-
-	SheetList[0] = SheetNameBuffer;								//First Entry is NULL the start
-	CrawlSheets( path, RootFile, SheetList, &NumberOfSheets, &SheetNameSize );	//Get the number and total storage of the sheets
-
-	NumberOfSheets = 0;
-	while( *SheetList[NumberOfSheets] != '\0' ) NumberOfSheets++;						//Count the number of unique sheets
-
-	printf("\n\nThere are %d unique sheets:", NumberOfSheets  );
-
-	for( i = 0; i < NumberOfSheets; i++)
-			UpdateSchematicFileRefDes( path, SheetList[i], modules, RefDesChangeArray );
-
-} //UpDateSchematicHierarchy
-
-/*
- * Add if this is a new sheet name otherwise ignore
- * The SheetNameList first element points to the start go the SheetNamseBuffer, the rest of the pointers are NULL
- * If the SheetNameList pointer itself is nor, do not add the sheet name
- */
-
-void	AddSheetName( char *SheetName, char *SheetNameList[] )
-{
-int	i = 0, found = 0;
-
-	if( SheetNameList != NULL )					//This is the second pass so copy the data
+	for( i = 0; i < NumberOfEntries; i++ )			//Initialize the array
 	{
-		while( SheetNameList[ i ] != NULL )			//Until the no strings to look at
-			if( strcmp( SheetName, SheetNameList[ i++ ]) == 0 ) found = 1; 	//Look for the sheet name in the array of names
-
-		if( found == 0 )					//This is a new string
-		{
-			strcpy( SheetNameList[i - 1], SheetName );			//Copy the name into the SheetNameBuffer
-			SheetNameList[ i ] = SheetNameList[i - 1] + strlen( SheetName ) + 1;	//Update the array pointer (next pointer already NULL)
-		}
-
+		memset( &FileList[i].filebuffer, 0, MAXPATH );				//Make sure all names are null
+		FileList[i].filebuffer = NULL;
+		FileList[i].maxfilesize = 0;
 	}
-}// AddSheetName()
+}
+
+//
+// If the extension is in the passed filename, remove it
+//
+
+void    TrimExtension( char *filename, char *extension )
+{
+char    *pntr = strrchr( filename, '.');         //Look for extension from the right
+        if( NULL != pntr )                      //There is an extension
+            if( 0 == strcasecmp( pntr, extension ))
+                *pntr = '\0'; //and it is extension
+}
 
 /*
- * This is a recursive function.
+ * This is a recursive function!
  * It loads a sheet into memory and scans it for $Sheet(s) and
- * 	1) counts the number of sheets
- * 	2) sizes the F1 field string (schematic.sch for the sheet)
- * 	3) if the SheetNamePointer != NULL it copies the schematic.sch to the memory pointed to by
+ * 	1) counts the number of sheets (storage allocated = MAXPATH * number of sheets
+ * 	2) if the SheetNamePointer != NULL it copies the schematic.sch to the memory pointed to by
  * 		SheetNamePointer, increments the pointer ( next pointer in array) and saves the address
  * 		after the '\0' in the next pointer location and puts a '\0' there
  *
+ *      List of files will be replaced by eeSchema built in function sch_sheet_path.cpp and others
  */
-int	CrawlSheets( char *path, char *SheetName, char *SheetNameList[], int *NumberOfSheets, int *SheetNameSize )
+void	CrawlSheets( char *path, char *SheetName, struct KiCadFileInMemory *FileList, int *NumberOfSheets )
 {
 
-int		i, sheets = 0, sheetnamesize = 0;			//Sheets and Bytes in all the sheets
-char	*buffer, *scanner; 												//Load this file and extension
+int		i, sheets;						//Sheets and Bytes in all the sheets
+char	*scanner; 						//Load this file and extension
 
-	AddSheetName( SheetName, SheetNameList );		//Add this sheetname to the array if a new name
+char    filename[ MAXPATH * 2 ];               //room for the complete filename
 
-	buffer = LoadFile( path, SheetName, "" );			//Load the file
-	G_Buffer = buffer;									//In case of error
-	scanner = buffer;
+//
+// Now look through all the sheet names to see if this is unique.
+// If so add to the end of the list
+//
+        TrimExtension( SheetName , ".sch");               //If it ends in sch or pro, trim
+        TrimExtension( SheetName , ".pro");
 
-	do	//* First, scan through to see how much space you need.
+        MakeFileName( filename, path, SheetName, ".sch");       //Default sheet has .sch so trim then add
+
+        i = 0;
+	    if( FileList != NULL )          //If I am not just counting
+	    {
+		    while( '\0' != FileList[i].filename[0] )							//Until the no strings to look at
+		        if( strcmp( filename, FileList[i].filename ) == 0 ) break;
+				    else i++;													//Look next
+
+		    if( '\0' == FileList[i].filename[0] )								//Got to the end
+		        strcpy( FileList[i].filename, filename );                       //Copy the name into the last spot
+
+	    }
+
+char    *buffer = LoadFile( filename, (FileList == NULL ? NULL : &(FileList[i].maxfilesize)) );		//Load this file and extension, get file size
+
+int	    numrefdes = CountStrings( buffer, "$Comp" );						//How many components in this schematic
+        sheets = CountStrings( buffer, "$Sheet" );							//How many sheets are there in this schematic
+
+        if( FileList != NULL )
+            FileList[i].maxfilesize += (long) (( numrefdes * 2) * MAXREFDES );			//The file can't be any bigger than this (i.e. components * 128 )
+
+        if( 0 == sheets )				//No more sheets so finis
+        {
+            free( buffer );
+            return;
+        }
+
+        *NumberOfSheets += sheets;							//Accumulate the number of sheets
+
+        struct	KiCadFileInMemory CrawlFileList[ sheets + 1 ];
+        ClearKiCadFileInMemoryStruct( CrawlFileList, sheets );
+
+        scanner = buffer;							//Start over
+        for( i = 0; i < sheets; i++ )				//This makes an array of names of files
+            scanner = ScanForSheets( scanner, &CrawlFileList[i] );
+
+        free( buffer );				//I am now done with that file for name scanning
+
+        for( i = 0; i < sheets; i++ )	//Now crawl through each sheet
+            CrawlSheets( path, CrawlFileList[i].filename, FileList, NumberOfSheets );
+} //NuCrawlSheets()
+
+//
+// Returns the number of times the string is found in the buffer
+//
+int	CountStrings( char *buffer, char *string )
+{
+int	count = 0;
+
+	while( NULL != buffer )
 	{
-		scanner = ScanForSheets( scanner, NULL, &sheetnamesize );
-		if( scanner != NULL ) ++sheets;
-
-	}while( scanner != NULL );							//Until the EOF
-
-	*NumberOfSheets += sheets;							//Accumulate the number of sheets
-	*SheetNameSize += sheetnamesize;				//And the space needed for them
-
-char	*sheetarray[ sheets ];								//Where the names are kept
-char	sheetnames[ sheetnamesize + ( sheets * 2 )];		//Room for the sheet names
-
-	scanner = buffer;							//Start over
-	sheetnamesize = 0;							//Keep track of the length
-	for( i = 0; i < sheets; i++ )				//This makes an array of names of files
-	{
-		sheetarray[i] = &sheetnames[sheetnamesize];
-		scanner = ScanForSheets( scanner, sheetarray[i], &sheetnamesize );
+		buffer = strstr( buffer, string );
+		if( NULL != buffer )
+		{ count++;
+		  buffer += sizeof( string );
+		}
 	}
-	free( buffer );				//I am now done with that file for name scanning
-	G_Buffer = NULL;
 
-	for( i = 0; i < sheets; i++ )	//Now crawl through each sheet
-		CrawlSheets( path, sheetarray [i], SheetNameList, NumberOfSheets, SheetNameSize );
+	return( count );
 
-	return( 0 );
-} //CrawlSheets()
-
+}
 
 /*
  * Scan for each sheet by name. If $Sheet is found, pull in the name
- * If sheetnamedest != Null copy it else just tally the size of the name
+ * If sheetnamedest != Null copy it else just count (storage of sheetname assumed to be MAXPATH
  * Return pointer past $EndSheet if found else NULL
  */
 
-char	*ScanForSheets( char *scanner, char *sheetnamedest, int *sheetsize )
+char	*ScanForSheets( char *scanner,  struct KiCadFileInMemory *SheetStruct )
 {
 char	*endsearch;
 char	tmpc;
-int		namelen;
 
 	scanner = strstr( scanner, "$Sheet" );				//Look for a sheet
 	if( scanner != NULL )								//I found something
@@ -1227,24 +1462,35 @@ int		namelen;
 
 		tmpc = *endsearch;								//Save the character
 		*endsearch = '\0';								//End the search here
-
-char	ThisName[ endsearch - scanner ];				//File name can't be bigger
-
-		PullFieldString( ThisName, scanner, "F1" );
+		PullFieldString( SheetStruct->filename, scanner, "F1" );
 		*endsearch = tmpc;								//Restore the byte
 		scanner = endsearch + sizeof( "$EndSheet" );	//Skip to the end
-
-		namelen = strlen( ThisName );
-
-		if( sheetnamedest != NULL )
-		{
-			strcpy( sheetnamedest, ThisName );			//Get a copy of the name
-			sheetnamedest[ namelen ] = '\0';			//Zero terminate it
-		}
-		*sheetsize += namelen + 1;						//Tally the bytes needed
 	}
 	return( scanner );									//Look from here
 }
+
+
+
+/*
+ * Add if this is a new sheet name otherwise ignore
+ * SheetNameList is a buffer with sheet names MAXPATH long
+ */
+
+void	AddSheetName( char *SheetName, char *SheetNameList )
+{
+int	found = 0;
+
+	if( SheetNameList == NULL ) return;
+
+		while(( '\0' != *SheetNameList ) && ( 0 == found ))		//Until the no strings to look at or found
+			if( strcmp( SheetName, SheetNameList ) == 0 )
+				found = 1; 	//Look for the sheet name in the array of names
+			else SheetNameList += MAXPATH;										//Look next
+
+		if( found == 0 )		//This is a new string i points past
+			strcpy( SheetNameList, SheetName );			//Copy the name into the SheetNameBuffer
+} // AddSheetName()
+
 
 /*
  * Locate a field with text SearchFor and find the starting '"'
@@ -1271,235 +1517,182 @@ char	tmpc;
 
 /*
  * Find the schematic component in the RefDesCHangeArray and append it to the destination
- *
+ * If the field ends with ? it is either an unannotated part or the ref des is in AR field
+ * return 0 if found, 1 is unannotated, -1 is not found
  */
 
-void	FindSchematicComponent( char *dest, char *field, struct RefDes *RefDesChangeArray, int modules, int buflen )
+int		FindSchematicComponent( struct RenumParams *Params , char *deststr, char *field, int *err_report )
 {
 int	i;
-char	tmpstr[10];			//Room for integer string
+char	NewRefDes[MAXREFDES * 3];		//Store the component here
 
-	for( i = 0; i < modules; i++) 							//Search through the change array
+    if( '?' == field[strlen(field)- 1] )                           //Un annotated component or AR field mismatch
+    {
+        strcat( deststr, field );
+        return( 1 );                                //Ended with a ?
+    }
+
+	for( i = 0; i < Params->Modules; i++) 							//Search through the change array
 	{
-		if( strcmp( field, RefDesChangeArray[i].OldRefDesString	) == 0 )		//If the string is found
+		if( strcmp( field, Params->RefDesChangeArray[i].OldRefDesString	) == 0 )		//If the string is found
 		{	//This is what I want to substitute
-			if( RefDesChangeArray[i].OldRefDes == SKIPREFDES )		//Do not substitute with a new refdes
-				SafeStringConcatinate( dest, RefDesChangeArray[i].OldRefDesString, buflen );	//Basically do nothing
-			else
-			{ //The component has been found
-				SafeStringConcatinate( dest, RefDesChangeArray[i].prepend, buflen );
-				SafeStringConcatinate( dest, RefDesChangeArray[i].RefDesType, buflen );
-				sprintf( tmpstr, "%d", RefDesChangeArray[i].NewRefDes );
-				SafeStringConcatinate( dest, tmpstr, buflen );
-				RefDesChangeArray[i].Found++;							//Found it at least once.
-			}
+			if( Params->RefDesChangeArray[i].OldRefDesNum != SKIPREFDES )						//Do not substitute with a new refdes
+			    MakeNewRefDes( NewRefDes, &Params->RefDesChangeArray[i] );
+			Params->RefDesChangeArray[i].Found++;							//Found it at least once.
 			break;			//Out of the search loop
 		}
 	}
-	if( i >= modules )	//Not found in RefDesChangeArray
-	{
-			printf("\nSchematic refdes %s not found in change array!\n", field );		//In case of PWR, etc..
-			SafeStringConcatinate( dest, field, buflen );
-			SafeStringConcatinate( dest, "-NOTFOUND", buflen );
-	}
+
+    if(( Params->RefDesChangeArray[i].OldRefDesNum == SKIPREFDES ) ||     //Do not substitute with a new refdes
+            ( i >= Params->Modules ))	                                  //Not found in RefDesChangeArray
+        strcpy( NewRefDes, Params->RefDesChangeArray[i].OldRefDesString );      //Basically do nothing
+
+
+    if(( i >= Params->Modules ) && ( 0 == err_report ))                             //Not found in change array
+    {	    *err_report += 1;
+            printf("\nSchematic refdes %s not found in change array!", field );     //In case of PWR, etc..
+            ++Params->errcount;
+            strcpy( NewRefDes, field );
+            strcat( NewRefDes, "-NOTFOUND" );
+    }
+	NewRefDes[MAXREFDES] = '\0';			//As long as it gets
+	strcat( deststr, NewRefDes );			//And put it here
+	return(( i >- Params->Modules )? 0: -1 );
 } //FindSchematicComponent()
+
 
 /*
  * Process the input component to the output component with the RefDesChangeArray
+ *
+ * source points to $comp .... $endcomp zero terminated
+ * dest points to the output buffer
+ *
+// * Process one line at a time, make substitutions if necessary, and copy to the output buffer
+ *
  */
 
-void	ProcessComponent( char *dest, char *source, struct RefDes *RefDesChangeArray, int modules )
+void	ProcessComponent( struct RenumParams *Params, char *dest, char *source )
 {
-int		buflen = strlen( source );
+int		buflen = strlen( source );		//How long is it?
 
-char	aline[buflen];
-char	field[buflen];
-char	*lineptr = aline;
-char	*fieldptr = field;
-char	tmpc;
+char	aline[buflen + 1];			//Where each line is kept (can't be longer than the source)
+char	field[buflen + 1];			//Where the field ( ) is kept
+char    errfield[buflen + 1];       //Copy of the field for error reporting
 
-	*dest = '\0';							//Start with a blank sheet
+char	*lineptr, *fieldptr;
+char	tmpc;					//Used to zero terminate
 
-	while( *source != 0 )					//Until the end
+int		i = 0, j = 0, err_report = 0;
+int     foundcmp;
+bool    unannotated = TRUE, endofcomp = FALSE;
+
+        errfield[0] = '\0';             //Null out the error field
+		do
+			if(( '\n' == source[i] ) || ( '\r' == source[i] )) j++; //Count #lines (no more than one refdes per line
+		while( '\0' != source[i++] );
+
+char	tmpdest[ buflen + ( MAXREFDES * j ) + 1 ];		//Room for substitution
+
+	while( *source != 0 )					//Until the end of the $comp ... $endcomp
 	{
 		fieldptr = field;
 		lineptr = aline;					//Point to start of line
 		*lineptr = '\0';					//Zero terminate
 		*fieldptr = '\0';
+		tmpdest[0] = '\0';
 
-		while(( *source != '\n' ) && ( *source != '\r') && ( *source != '\0')) //Copy until newline or line feed
+		while(( *source != '\n' ) && ( *source != '\r') && ( *source != '\0')) 		//Copy until newline or line feed
 				*lineptr++ = *source++;
-
 		while((( *source == '\n' ) || ( *source == '\r')) && ( *source != '\0'))	//Copy the newline and line feed
 				*lineptr++ = *source++;
-		*lineptr = '\0';							//Terminate
-		field[0] = '\0';
+
+		*lineptr = '\0';							//Terminate the end of the line
+		field[0] = '\0';							//No field found
 		lineptr = aline;							//Point to start of line
 
 		if( *lineptr == 'L')						//Is this the first line? (ie. L LED D201 )
 		{
-			lineptr += 2;
+		    lineptr += 2;
 			while(( *lineptr != ' ' ) && ( *lineptr != '\0')) lineptr++;		//Skip to non space
 			tmpc = *++lineptr;				//Skip the space and get the next character
 			*lineptr = '\0';
-			strcat( dest, aline );		//Copy up to here to destination
+			strcat( tmpdest, aline );		//Copy up to here to destination
 			*lineptr = tmpc;
 			while(( *lineptr > ' ' )  && ( *lineptr != '\0')) *fieldptr++ = *lineptr++;	 //copy the field
 			*fieldptr = '\0';		//Zero terminate
-
+			strcpy( errfield, field );
 		}
 		else if ( strstr ( lineptr, "F 0") == lineptr )		//"F 0" at start of line (i.e. F 0 "D501" H 5600 4025 50  0000 C CNN )
 		{
 			lineptr += ( sizeof( "F 0") - 1 );
-			lineptr = CopyCompField( aline, lineptr, dest, field ); //Get the field starting at "
+			lineptr = CopyCompField( aline, lineptr, tmpdest, field ); //Get the field starting at "
 		}
 		else if ( strstr ( lineptr, "AR") == lineptr )		//"AR" at start of line (i.e. AR Path="/579A9AFE/579AA2E5" Ref="D201"  Part="1" )
 		{
-			lineptr = strstr( lineptr, "Ref=" ) + sizeof( "Ref=") - 1;			//Find the Ref= tag
-			lineptr = CopyCompField(  aline, lineptr, dest, field ); 				//Get the field starting at "
+		    lineptr = strstr( lineptr, "Ref=" ) + sizeof( "Ref=") - 1;			//Find the Ref= tag
+			lineptr = CopyCompField(  aline, lineptr, tmpdest, field ); 			//Get the field starting at "
 		}
-		else
-			strcat( dest, lineptr );	//No fields found just copy this line to the end
+
+		else if ( strcasestr( lineptr, "$ENDCOMP" ) == lineptr )
+		{
+		    endofcomp = TRUE;
+		    strcat( tmpdest, aline );
+		}
+
+		else strcat( tmpdest, aline );					//No fields (L, F0, AR) found just copy it
 
 		if( field[0] != '\0' )						//I found something
 		{
 			if( field[0] == '#')						//Fake refdes (#pwr, etc
-				strcat( dest, field );					//Copy the fake refdes
+			{	strcat( tmpdest, field );					//Copy the fake refdes
+				strcat( tmpdest, lineptr );					//Append after field
+				unannotated = FALSE;
+			}
 			else
-				FindSchematicComponent( dest, field, RefDesChangeArray, modules, buflen );
-			strcat( dest, lineptr );	//No fields found just copy this line to the end
+			{	//Find the component and copy it to tmprefdes
+			    foundcmp = FindSchematicComponent( Params, tmpdest, field, &err_report );   //Return 0 if found,  is ends with ?, -1 not found
+			    if( foundcmp == -1 ) printf("\nComponent not found");
+			    if( 0 == foundcmp ) unannotated = FALSE;        //Was found at least once
+ 				strcat( tmpdest, lineptr );					//Append after the second "
+			}
 		}
+
+		if(( TRUE == unannotated ) && ( TRUE == endofcomp ))
+		        printf("\n\n **** Warning unannotated component %s! ****", errfield );
+		strcat( dest, tmpdest );
 	}
 } //ProcessComponent
 
-/*
- *  * Scan through the PCB file and substitute RefDes Old for RefDes New
- * The input file name has already been determined by the hierarchy scan so no need to add .sch
- */
-
-void	UpdateSchematicFileRefDes( char *path, char *fname, int modules, struct RefDes *RefDesChangeArray )
-{
-char	*found, *nextcomp;			//Where stuff is
-
-int		outnamesize = strlen( path ) + strlen( fname ) + 2;
-char	outfilename[ outnamesize ];			//make the filename and extension
-
-int		complen;
-
-char	*buffer = 	LoadFile( path, fname, "" );			//Load this file and extension
-char	*head = buffer;										//Where to start or end writing.
-char	*compend;
-
-if( MakeBackupFile( path, fname, "" ) != 0 )
-		RenumError( "Unable to create SCH Backup file", SCHBACKUPERROR );
-
-	MakeFileName( outfilename, path, fname, "", outnamesize );
-
-	printf("\n   Updating %s", outfilename );
-
-	G_WriteFile = fopen ( outfilename,"wb+");			//Open the file
-
-	if (G_WriteFile  == NULL)						//Not found
-			RenumError( "Can't create schematic output file!", SCHWRITECREATEERROR );
-
-		nextcomp = strstr( buffer, "$Comp");			//Use this to find where the next module starts
-		while( nextcomp != NULL )	//Scan through the buffer (PCBFIle) and replace old refdes with new ones.
-		{
-			found = nextcomp; 								//Find the "$Comp" token
-			if( found != NULL )								//I did find a modules token
-			{
-				if( fwrite( head, sizeof(char), (found - head)/sizeof(char) , G_WriteFile ) != (found - head)/sizeof(char))
-					RenumError( "Can't write to file!", OUTFILEWRITEERROR );
-
-				compend = strstr( found, "$EndComp") + sizeof( "$EndComp" ) - 1;			//Find the end of the component
-				head = compend;
-
-				complen = (compend - found);				//How big is it
-		char	tmpcomponent[ complen + 3];					//place to make a copy of the component
-		char	destcomponent[complen * 2 ];				//Where the output goes
-
-				memcpy( tmpcomponent, found, complen );
-				tmpcomponent[ complen ] = '\0';
-
-				ProcessComponent( destcomponent, tmpcomponent, RefDesChangeArray, modules );
-				fprintfbuffer( destcomponent );
-				nextcomp = strstr( found + sizeof("$Comp"), "$Comp");			//Use this to find where the next module starts
-			}
-		}// while
-/*
-* All the modules have been found and replaced. Now write out the end of the file
-*/
-		fprintfbuffer( head );
-		fclose (G_WriteFile);
-} //UpdateSchematicFileRefDes()
-
-/*
- * Enter a $Sheet structure which is zero terminated.
- * Find the field, then a '"'. Copy from the '"' to the next quote
- *
- *
- * return NULL if not found
- */
-void	PullFieldString( char *dest, char *buffer, char *instr )
-{
-char	*found;
-
-		*dest = '\0';									//Assume not found
-
-		found = strstr( buffer, instr );
-		if( found != NULL )			//I found the field
-		{
-			while(( *found != '"') && ( *found != '\0')) found++;	//find the '"'
-			if( *found != '\0' ) found++;
-			while(( *found != '"') && ( *found != '\0'))
-				*dest++ = *found++;						//Copy the string
-			*dest++ = '\0';									//Make sure zero terminate
-		}
-} //PullFieldString
-
-
-/*
-*	I use fprintf a lot
-*/
-void	fprintfbuffer( char *buffer )
-{
-		if( fprintf( G_WriteFile, "%s", buffer ) < 0 )		//Wite out what you got to here
-			RenumError( "Can't write to file!", OUTFILEWRITEERROR );
-}//void	fprintfbuffer( char *buffer )
 
 /*
 * This is a consolidated and simplified search and replace (rather than two passes for modules and nets )
-*
 */
-void	UpdatePCBFileRefDes( char *path, char *fname, int modules, struct RefDes *RefDesChangeArray, char *buffer )
+//void	UpdatePCBFileRefDes( struct RenumParams *Params, struct ProjectFileStruct *ProjectFile , int modules,
+//			struct RefDes *RefDesChangeArray, struct	KiCadFileInMemory *FileList, char *buffer )
+
+void	UpdatePCBFileRefDes( struct RenumParams *Params, struct	KiCadFileInMemory *FileList )
 {
-char	*head = buffer;				//Where to start or end writing.
+char	*head = Params->pcbbuffer;				//Where to start or end writing.
 char	*fp_text_ptr, *Net_ptr;
 char	*changestr, *srcnptr, delimiter;
 
 char 	OldRefDes[MAXREFDES+1];		//What the OldRefDes is (i.e. U, R VR, etc.)
+char	NewRefDes[ 3 * MAXREFDES];		//Where the new refdes goes
 
 int 	i, no_fp = 0, no_net = 0;	//Clear the no more flags
 int		nummodules = 0;				//Number of refdes found
 int		numnets = 0;				//Number of nets found
 
-int		outnamesize = strlen( path ) + strlen( fname ) + sizeof( ".kicad_pcb" ) + 2;
-char	outfilename[ outnamesize ];			//make the filename and extension
+		MakeFileName( FileList->filename, Params->projectpath, Params->projectfilename, ".kicad_pcb" );			//Make the full file name - even though it is in memory
+		FileList->filebuffer = calloc( FileList->maxfilesize, sizeof( char ) ); //Allocate room for the output
 
-FILE	*debughandle;
+char	*outbuffer = FileList->filebuffer;
 
-		if( MakeBackupFile( path, fname, ".kicad_pcb" ) != 0 )
-			RenumError( "Unable to create PCB Backup file", PCBBACKUPERROR );
-
-		MakeFileName( outfilename, path, fname, ".kicad_pcb", outnamesize );
-
-		G_WriteFile = fopen ( outfilename,"wb+");			//Open the file
-		if (G_WriteFile  == NULL)						//Not found
-				RenumError( "Can't create output file!", OUTFILEOPENERROR );
-
-		debughandle = OpenDebugFile( path, fname, "_update", ".txt", "Reference designations and net list changes" );
-		fprintf(debughandle, "***************************** Change List *****************************");
-		fprintf(debughandle, "\n#\tWas\tIs\tType");
+        if( 0 != (Params->log & LOGCHANGE))
+		{
+            fprintf(Params->loghandle, "\n\n\n*********** Change List ***********");
+            fprintf(Params->loghandle, "\n#          Was     Is        Type");
+		}
 
 		while( *head != 0 )	//Until the end of the file
 		{
@@ -1535,7 +1728,7 @@ FILE	*debughandle;
 
 			OldRefDes[0] = *srcnptr;						//Save the character in the old ref des array
 			*srcnptr = '\0';								//Zero terminate
-			fprintfbuffer( head );							//Write out what you got to here
+			outbuffer = CopyBuffer( outbuffer, head );							//Write out what you got to here
 //
 // Save the old refdes just in case there is no change
 //
@@ -1549,44 +1742,320 @@ FILE	*debughandle;
 			OldRefDes[i] = '\0';								//End the string
 			head = srcnptr + i;									//Remember where to pick this up
 
-			for( i = 0; i < modules; i++)					//Search the change array
+			for( i = 0; i < Params->Modules; i++)					//Search the change array
 			{
-				if( strcmp( OldRefDes, RefDesChangeArray[i].OldRefDesString	) == 0 )
+				if( strcmp( OldRefDes, Params->RefDesChangeArray[i].OldRefDesString	) == 0 )
 				{	//This is what I want to substitute
 					if( delimiter == '-' )numnets++;		//One more net
 					else nummodules++ ;						//or module
 
-					if( RefDesChangeArray[i].OldRefDes == SKIPREFDES )		//Do not substitute with a new refdes
-						fprintfbuffer( OldRefDes );							//So write out the old one
+					if( Params->RefDesChangeArray[i].OldRefDesNum == SKIPREFDES )		//Do not substitute with a new refdes
+						outbuffer = CopyBuffer( outbuffer, OldRefDes );							//So write out the old one
 					else	//Replace the refdes string
 					{	//Found the new refdes so write that out
-						if( fprintf( G_WriteFile, "%s%s%d", RefDesChangeArray[i].prepend,
-								RefDesChangeArray[i].RefDesType, RefDesChangeArray[i].NewRefDes ) < 0 )				//Write it to a file
-									RenumError( "Can't write to file!", OUTFILEWRITEERROR );
+						MakeNewRefDes( NewRefDes, &Params->RefDesChangeArray[i] );
+						outbuffer = CopyBuffer( outbuffer, NewRefDes );							//Add to the output file
 					}
 
-					fprintf( debughandle, "\n%d\t%s\t%s%s%d\t%s", i, OldRefDes, RefDesChangeArray[i].prepend,
-						RefDesChangeArray[i].RefDesType, RefDesChangeArray[i].NewRefDes, changestr );
-					if( RefDesChangeArray[i].OldRefDes == SKIPREFDES ) fprintf( debughandle, "\t*** will be ignored ***");
+					if( 0 != (Params->log & LOGCHANGE))
+					{
+			                NewLineNumber(Params, i, 5 );
+			                LineItUp( Params, OldRefDes, 16  );
+			                LineItUp( Params, NewRefDes, 16  );
+			                LineItUp( Params, changestr, 8  );
+					}
+
+					if( Params->RefDesChangeArray[i].OldRefDesNum == SKIPREFDES )
+					{    if( 0 != (Params->log & LOGCHANGE))
+	                        fprintf( Params->loghandle, "*** will be ignored ***");
+					}
 
 					break;			//Out of the for search loop
 				}
 			}	//for
-			if( i >= modules )					//If not found just write the old ref des
+			if( i >= Params->Modules )					//If not found just write the old ref des
 			{
-				fprintfbuffer( OldRefDes );		//Write out what was the old refdes
+				outbuffer = CopyBuffer( outbuffer, OldRefDes );		//Write out what was the old refdes
 				if( delimiter == '\0' )			//If a module
-					printf("\n  Warning module reference designation %s not found in change array", OldRefDes );
+				{	if( Params->errcount++ < 20 )
+						printf("\n  PCB Update warning module refdes %s not found in change array", OldRefDes );
+
+					if( Params->errcount== 20 ) printf("\n Too many errors - stop reporting them ");
+				}
 			}
 		}//While
-		fprintfbuffer( head );								//Flush the rest of the file
-		fclose (G_WriteFile);
+		outbuffer = CopyBuffer( outbuffer, head );								//Flush the rest of the file
+		FileList->maxfilesize = ( outbuffer - FileList->filebuffer );			//Actual Bytes transfered
 
-		fclose ( debughandle );
+}//long int	UpdatePCBFileRefDes( struct ProjectFileStruct *ProjectFile , int modules, struct RefDes *RefDesChangeArray, char *outbuffer, char *buffer )
 
-		printf("\n\nUpdated %d modules and %d nets in the PCB file", nummodules, numnets );
-}//void	UpdatePCBFileRefDes( char *path, char *fname, int modules, struct RefDes *RefDesChangeArray, char *buffer )
 
+
+/*
+ *  * Scan through the Schematic file and substitute RefDes Old for RefDes New
+ * 	The input file name has already been determined by the hierarchy scan so no need to add .sch
+ *	The new file is buffered in FileList.buffer
+*/
+
+void	UpdateSchematicFileRefDes( struct RenumParams *Params, struct KiCadFileInMemory *FileList )
+{
+
+char	*found, *nextcomp;							//Where stuff is
+char	tmpc;
+char	*compend;
+
+char    schfilename[MAXPATH];
+char    tmpschname[MAXPATH];
+
+        strcpy( tmpschname, FileList->filename );
+        TrimExtension( tmpschname, ".sch" );            //remove implied extension if present
+
+		MakeFileName( schfilename, Params->projectpath, tmpschname, ".sch" );
+		FileList->filebuffer = calloc( FileList->maxfilesize, sizeof( char ) ); //Allocate room for the output
+char	*outbuffer = FileList->filebuffer;						//Where stuff goes
+
+char	*buffer = LoadFile( schfilename, NULL );			//Load the file but do not adjust the size
+char	*head = buffer;											//Where to start or end writing.
+
+		nextcomp = strstr( buffer, "$Comp");			//Use this to find where the next module starts
+		while( nextcomp != NULL )	//Scan through the buffer (PCBFIle) and replace old refdes with new ones.
+		{
+			found = nextcomp; 								//Find the "$Comp" token
+			{
+				outbuffer = CopyHereToThere( outbuffer, head, found );
+				compend = strstr( found, "$EndComp") + sizeof( "$EndComp" ) - 1;			//Find the end of the component
+				head = compend;											//Pick up from after $EndComp
+
+				tmpc = *compend; *compend = '\0';						//Zero terminate the string rather than copy it
+				ProcessComponent( Params, outbuffer, found  );			//Processes from $Comp ... $Endcomp
+				*compend = tmpc;										//Restore the string
+				while( '\0' != *outbuffer ) ++outbuffer;				//Find the end of what was just added
+				nextcomp = strstr( found + sizeof("$Comp"), "$Comp");			//Use this to find where the next module starts
+			}
+		}// while
+
+		outbuffer = CopyBuffer( outbuffer, head );	 					//Add to the output file
+		FileList->maxfilesize = outbuffer - FileList->filebuffer;		//Number of bytes
+
+		if( NULL != buffer ) free( buffer );
+	printf("\nSCH Updated %s size %ld", schfilename, FileList->maxfilesize );
+
+} //UpdateSchematicFileRefDes()
+
+
+/*
+ *  Scan through the Netlist file and substitute RefDes Old for RefDes New
+ *  Netlist update is simple Nets are all like this (ref C18)
+ *  So if the new ref des is C123 I replace C18 with C123
+ *
+ * (components
+ *   (comp (ref C12)
+ *
+ * and
+ *
+ *    (net (code 1) (name FPGA_87)
+ *     (node (ref U8) (pin 4))
+ *     (node (ref U6) (pin 87)))
+ *
+ */
+
+void		UpdateNetlistRefDes( struct RenumParams *Params, struct KiCadFileInMemory *FileList )
+{
+char	*found, *nextnet;			//Where stuff is
+
+char	OldRefDes[3*MAXREFDES];			//Where to store the old ref des for the net (i.e. D2)
+char	NewRefDes[3*MAXREFDES];			//Where to store the old ref des for the net (i.e. D2)
+int		i;
+
+		MakeFileName( FileList->filename, Params->projectpath, Params->projectfilename, ".net" );
+		if( 0 != access(FileList->filename, F_OK)) //File not found
+		{
+			printf("\n*** Netlist file %s not found or empty", FileList->filename );
+			FileList->filebuffer = NULL;
+			FileList->filename[0] = '\0';
+			FileList->maxfilesize = 0;
+			return;
+		}
+
+char	*buffer = LoadFile( FileList->filename, &(FileList->maxfilesize) );		//Load this file and extension, get file size
+
+		FileList->maxfilesize += (2 * MAXREFDES * CountStrings( buffer, "(ref " )); //How many text reference fields
+		FileList->filebuffer = calloc( FileList->maxfilesize, sizeof( char ) ); 	//Allocate room for the output
+
+char	*head = buffer;										//Where to start or end writing.
+char	*outbuffer = FileList->filebuffer;
+
+		nextnet = strstr( buffer, "(ref ");				//Use this to find where the ref name
+//
+// Now work through the netlist file until no more "(ref "
+//
+		while( nextnet != NULL )							//Scan through the buffer and replace old refdes with new ones.
+		{
+			if( nextnet != NULL )								//I did find a net ...
+			{
+				found = nextnet + sizeof("(ref ") - 1;  								//Find the "(ref " token at found
+				outbuffer = CopyHereToThere( outbuffer, head, found );							//Write out what you got to here
+
+				i = 0;
+				while(( *found != ')') && ( i < MAXREFDES ))
+						OldRefDes[i++] = *found++;			//Copy the text after "(ref " until the ")")
+
+				OldRefDes[i] = '\0';							//End the string. nextnet points to the closing );
+
+				if( i >= MAXREFDES )
+					RenumError( "Invalid Netlist format!", BADNETLIST );	//Write out to this point
+
+//
+// OldRefDes now has the name of the old reference designation for the net. Find it in the change array
+//
+			for( i = 0; i < Params->Modules; i++)					//Search the change array
+			{
+				if( strcmp( OldRefDes, Params->RefDesChangeArray[i].OldRefDesString	) == 0 ) //Look up in the change array
+				{	//This is what I want to substitute
+					if( Params->RefDesChangeArray[i].OldRefDesNum == SKIPREFDES )		//Do not substitute with a new refdes
+							outbuffer = CopyBuffer( outbuffer, OldRefDes );						//So write out the old one
+
+					else	//Replace the refdes string
+					{		//Found the new refdes so write that out
+						MakeNewRefDes( NewRefDes, &Params->RefDesChangeArray[i] );
+						outbuffer = CopyBuffer( outbuffer, NewRefDes );						//So write out the new one
+					}
+						break;			//Out of the for search loop
+				}	//New ref des has been substituted
+			}	//For
+			if( i >= Params->Modules )
+			{   printf("\n****** Warning net %s not found in update table ", OldRefDes );
+			    outbuffer = CopyBuffer( outbuffer, OldRefDes ); //Not found!
+			}
+//
+//	nextnet points to the input buffer where the ")" of the (net C6) is
+//
+			head = found;										//Start looking from here (the ')' from (ref C26)
+			nextnet = strstr( found, "(ref ");				//Use this to find where the ref name
+			}
+		}// while
+/*
+* All the modules have been found and replaced. Now write out the end of the file
+*/
+		outbuffer = CopyBuffer( outbuffer, head);						//So write out the rest
+		FileList->maxfilesize = ( outbuffer - FileList->filebuffer );		//How many bytes transfered
+} //UpdateNetlistRefDes()
+
+
+/*
+ * Enter a $Sheet structure which is zero terminated.
+ * Find the field, then a '"'. Copy from the '"' to the next quote
+ *
+ * Bug fig (Bug reported by Sean T Happel who supplied a corrected PullFieldString Function)
+ *
+ * The field has to be preceded by a new line !
+ *
+ *
+ * return NULL if not found
+ */
+void    PullFieldString( char *dest, char *buffer, char *instr )
+{
+char    *found_start, *found_end;
+
+    	*dest = '\0';    //Assume not found
+int    	instr_len = strlen(instr);
+
+    	for(;buffer != NULL; buffer = strchr(buffer, '\n')){ // Start looking at the beginning of the buffer, then at each subsequent newline (windows uses \r\n, so \n will still start beyond newline)
+        while(isspace(*buffer)) buffer++;					// Skip any leading whitespace - including the previous \n found
+
+        if(strncmp(buffer, instr, instr_len) == 0)			// If appropriate field is found
+        {
+        	if(NULL == (found_start = strchr(buffer, '\"'))) return;
+
+        	found_start++;
+
+            if(NULL == (found_end = strchr(found_start, '\"'))) return;
+
+            memcpy(dest, found_start, found_end - found_start);
+            dest[found_end - found_start] = '\0';
+
+            return;
+        }
+    }
+    return;
+} //PullFieldString
+
+
+//
+// Copy zero terminated input to outbuffer
+// Return adjusted outbuffer pointer
+char *CopyHereToThere( char *dest, char *from, char *to )
+{
+char tmpc = *to;
+	*to = '\0';				//Zero terminate
+	while( *from != '\0') *dest++ = *from++;
+	*to = tmpc;
+	return( dest );
+}
+
+//
+// Make a ref dest string consisting of [prepend][refdestype][refdes]
+//
+// If the prepend starts with -, remove the prepend from the refdestype
+//
+// fnork
+void	MakeNewRefDes( char *NewRefDes, struct RefDes *RefDesChangeArray )
+{
+char *prepnt = RefDesChangeArray->prepend;
+    strcpy( NewRefDes, prepnt );                            //Make a copy of the prepend string
+    strcat( NewRefDes, RefDesChangeArray->RefDesType );     //And the type (eg C )
+
+    if( '-' == *prepnt )                //If stripping the prepend string
+	{
+	   ++prepnt;    //After the '-'
+	   if( 0 == strncmp( prepnt, RefDesChangeArray->RefDesType, strlen( prepnt )))   //If the prepend was there
+	      strcpy( NewRefDes, &RefDesChangeArray->RefDesType[ strlen( prepnt)]);	//Remove the prepend.
+	}
+	RefDesToString( NewRefDes, RefDesChangeArray->NewRefDesNum );	//Now the new refdes (1, 2, ...)
+	NewRefDes[MAXREFDES] = '\0';								//Maxlength
+}
+
+//
+// Append int to ascii string
+//
+void	RefDesToString( char *outstr, int refdes )
+{
+char	tmpstr[6];		//Max 100,000
+int		i;
+
+	for( i = 0; i < 6; i++ ) tmpstr[i] = '\0';	//Zap the string
+
+	for( i = 0; i < 6; i++)
+	{
+		tmpstr[i] = '0' + refdes % 10;		//Get the lsd, convert to ascii
+		refdes /= 10;						//Divide by 10
+		if( 0 == refdes ) break;			//All done
+	}
+	i++;									//Always have at least one digit
+//
+//tmpstr has a palindron of the string, i has the number of digits
+//
+	outstr += strlen( outstr );				//Find the end
+	do *outstr++ = tmpstr[--i]; while( 0 != i );	//Copy to the output;
+	*outstr = '\0';							//End the string
+}
+
+
+
+//
+// Copy zero terminated input to outbuffer
+// Return adjusted outbuffer pointer
+
+char	*CopyBuffer( char *outbuffer, char *input )							//Write out what you got to here
+{
+	while( *input != '\0') *outbuffer++ = *input++;
+	return( outbuffer );
+};
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+//	UI Functions
+//
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /*
 * Parse the string to determine the sort direction
@@ -1620,9 +2089,27 @@ struct	MenuChoice G_ModulesRefDesArray[] =
 		{ NULL, NULL, -1 }
 };
 
+
+char	*NewParameterList[] =
+{
+	"PCB file name",							//0
+	"Root schematic file name",					//1
+	"Netlist file name",						//2
+	"Top Sort Direction",						//3
+	"Bottom Sort Direction", 					//4
+	"Top Start Reference Designation", 			//5
+	"Bottom Start Reference Designation",		//6
+	"Sort on Modules/Reference Designators",	//7
+	"Sort Grid",								//8
+    "Log",                                      //9         This is read only (a hack, I know ...)
+	""
+};
+
+
+
+
 void	SetSortDirection( char* argv, int *SortCode )
 {
-
 struct	MenuChoice *DirArray = &G_DirectionsArray[0];
 int		i = 0;
 
@@ -1645,7 +2132,7 @@ int		i = 0;
 		do
 		{
 			if( choices[i].code == code ) return( choices[i].string );
-		} while( choices[i++].code != -1 );
+		} while( choices[++i].code != -1 );
 
 		return( "Invalid menu code ");
 } //GetSortString
@@ -1707,7 +2194,6 @@ int	i, j;
 int	getchEASCII( void )
 {
 	return( getch() );
-
 }
 
 #else
@@ -1861,530 +2347,303 @@ int	tmpc, menuentry;
 
 
 
-/*
- * Parse the command line arguments there is at least 1: the input file name
- */
+//
+// Chop up the file name into path, name, extension.
+// Replace the extension with the argument, reconstruct the file name
+// Check if the file name exists. Return 0 if it does not
+//
 
-
-/*
- * Set the input file name and create a backup copy
- */
-void	SetInfile( char* argv )
+int		CheckInputFileName( struct RenumParams *Params, char *extension )
 {
-	G_InputFileName = argv;						//set the input file name
+char    filename[MAXPATH];
+char    slashstr[2];
+char    *lastslash= strrchr( Params->projectfilename, SLASHCHR );              //Path ends with the first slash from the right
+char    tmpc;
+
+Params->projectpath[0] = '\0';                                          //You got nothing!
+
+        slashstr[0] = SLASHCHR;
+        slashstr[1] = '\0';
+
+        if( lastslash != NULL)                                      //I found a slash
+        {
+            tmpc = *lastslash;          //Save this
+            *lastslash = '\0';          //Terminate
+            strcpy( Params->projectpath, Params->projectfilename );
+            *lastslash = tmpc;          //Restore
+
+            if( Params->projectpath[strlen(Params->projectpath) - 1 ] != SLASHCHR )
+                strcat( Params->projectpath, slashstr );                                 //Add a trailing slash
+        }
+
+		MakeFileName( filename, Params->projectpath, Params->projectfilename, extension );		//Make the full file name
+		if( 0 != access(filename, F_OK))
+		{
+			printf("\n\nFile not found: %s\n\n", filename );
+			return( 0 );				//Nada
+		}
+		return( 1 );
 }
 
+//
+//  WriteParameterFile and LoadParameter are both made quick and dirty as they will be stripped out
+//	Once I integrate with pcbnew
+//
 /*
- * Set the top level prepend string
- */
-void	SetTopPrepend( char *argv )
+ * char	*NewParameterList[] =
 {
-	G_TopPrepend = argv;			//set the input file name
-}
+	"PCB file name",						//0
+	"Root schematic file name",				//1
+	"Netlist file name",					//2
+	"Top Sort Direction",					//3
+	"Bottom Sort Direction", 				//4
+	"Top Start Reference Designation", 		//5
+	"Bottom Start Reference Designation",	//6
+	"Sort on Modules/Reference Designators",	//7
+	"Sort Grid ",							//8
+    "Log",                                      //9         This is read only (a hack, I know ...)
+	"\0"
+};
 
-/*
- * Set the bottom level prepend string
- */
-void	SetBottomPrepend( char *argv )
-{
-	G_BottomPrepend = argv;			//set the input file name
-}
-
-/*
- * Set the grid parameter G_Grid
  *
  */
-void	Setgrid( char *argv )
-{
-	G_Grid = atof( argv );
-	if( G_Grid < MINGRID ) G_Grid = MINGRID;
-}
-
-/*
- * Set the top starting reference designator
- */
-void	SetTopStartRefDes( char *argv )
-{
-	G_TopStartRefDes = abs( atoi( argv ));
-}
-
-/*
- * Set the bottom starting reference designator
- */
-void	SetBottomStartRefDes( char *argv )
-{
-	G_BottomStartRefDes = abs( atoi( argv ));
-}
-
-/*
- * Set Top Sort Modes
- */
-void	SetTopSort( char *argv )
-{
-	SetSortDirection( argv, &G_TopSortCode );
-
-}
-
-/*
- * Set Bottom Sort Modes
- */
-
-void	SetBottomSort( char *argv )
-{
-	SetSortDirection( argv, &G_BottomSortCode );
-}
-
-/*
- * Sort on moudule location rather than refdes
- */
-void	SetSortOnModules( char *argv )
-{
-	G_SortOnModules = 1;
-}
-
-/*
- * Don't ask whether to run
- */
-void	SetNoQuestion( char *argv )
-{
-	G_NoQuestion = 1;
-}
-
-/*
- * Command error
- */
-
-void	CommandError( char *argv )
-{
-	printf("\nInvalid command %s", argv );
-}
-
-
-typedef void ( *CommandFunctionPtr )( char *argv );
-
-struct	CommandParse {
-	char	*Comstring;						//Variable length command string
-	CommandFunctionPtr CommandFunction;		//Execut this function if there is a match
-
-};
-
-struct 	CommandParse G_CommandParseArray[] = 	//Work through this array to parse commands
-{
-		{"-i", SetInfile },						//Set the input file name
-		{"-g", Setgrid },
-		{"-fp", SetTopPrepend },				//Set the top prepend text
-		{"-bp", SetBottomPrepend },				//Set the bottom prepend text
-		{"-fs", SetTopSort },					//Set the top sort modes
-		{"-bs", SetBottomSort },				//Set the bottom sort modes
-		{"-fr", SetTopStartRefDes },			//Set the top starting reference designator
-		{"-br", SetBottomStartRefDes },			//Set the bottom starting reference designator
-		{"-m", SetSortOnModules },				//Set the sort mode to sort on modules rate than refdes
-		{"-y", SetNoQuestion },					//Don't ask permission to run
-		{"-?", PrintHelpFile },					//Print out the command list
-		{ NULL, CommandError},					//End of list
-};
-
-/*
- * Parse the command line arguments
- * Note the char * globals (i.e. G_BottomPrepend ) are pointers to strings, not strings
- * So don't copy them because you'll overwrite memory!
- */
-void	ParseCommandLine( int argc, char *argv[] )
-{
-int		cmdarrayindex;
-int		i;
-
-char	*arg, *tmp, *comstring;
-
-	for( i = 1; i < argc; i++)			//Go through the commands and parse them
-	{
-		cmdarrayindex = 0;								//Start at the beginning
-		while(( comstring = G_CommandParseArray[cmdarrayindex].Comstring ) != NULL )
-		{
-			arg = argv[i];
-			if( *arg == '\'' ) arg++;		//For some reason under msys2, Eclipse wraps debug arguments with ' so ignore
-
-			while(( *comstring != '\0') && (*comstring == *arg++ )) ++comstring;		//Search so see if comstring at start of argv
-			if( *comstring == '\0')
-			{
-				tmp = arg;
-				while( *tmp != '\0') if( *tmp == '\'') *tmp = '\0'; else tmp++;				//Strip off trailing ' if any
-				( G_CommandParseArray[cmdarrayindex].CommandFunction ) (arg);
-				break;	//Out of the look for loop
-			}
-			++cmdarrayindex;							//Check the next in the list
-		}
-	}
-}//ParseCommandLine
-
-
-//
-// Check if the input file exists. Return 0 if it does not
-//
-
-int		CheckInputFileName( void )
-{
-int	i, j = strlen( G_InputFileName );
-int	lastslash = 0;
-
-	for( i = 0; i < j; i++ )	//Find the last / or \ in the path
-		if(( G_InputFileName[i] == '\\') || ( G_InputFileName[i] == '/')) lastslash = i;
-
-	for( i = lastslash; i < j; i++ )	//Locate any "." indicating a file extension
-		if( G_InputFileName[i] == '.') G_InputFileName[i] = '\0';			//Trim off the file extension
-
-	SafeStringConcatinate( G_InputFileName, ".kicad_pcb", MAXPATH ); 			//And the file extension
-
-
-FILE	*readhandle = fopen ( G_InputFileName,"rb");			//Open the file read only binary
-	if (readhandle == NULL)											//Not found
-	{
-		printf("\n\nFile not found: %s\n\n", G_InputFileName );
-		return( 0 );				//Nada
-	}
-	else
-	fclose( readhandle );
-	return( 1 );
-}
-
-/*
- * Get the input file name
- */
-
-int	GetInputFileName( void )
-{
-	StringGet( "\n\nFile name: ", G_FileName, G_InputFileName, MAXPATH );
-	G_InputFileName = G_FileName;
-	return( CheckInputFileName());
-}
-
-/*
- * Show the menu choices
- */
-
 //
 // This writes the parameter file into the local directory
 //
-void	WriteParameterFile( void )
+void	WriteParameterFile( struct RenumParams *Params )
 {
-int		i = 0;
-char	buffer[ MAXPATH * 2 ]; 	 	// allocate more memory than you'd need
-char	tbuf[MAXPATH];
-char	parametertype;
-void	*parameterpointer;
+FILE	*WriteFile = fopen ( Params->paramfilename,"wb+");			//Open the file
 
-	memset( buffer, 0, sizeof(char ) * MAXPATH * 2);				//Zero the destination buffer
-
-	while(G_ParameterFile[i].Parametername != 0 )
-	{
-		SafeStringConcatinate( buffer, (char *) G_ParameterFile[i].Parametername, ((sizeof(char) * MAXPATH * 2)) );
-
-		parametertype = G_ParameterFile[i].Parametertype;
-		parameterpointer = G_ParameterFile[i].Pointertoparameter;
-
-		if( parametertype == 'T' )		//If a text field
-				sprintf( tbuf, "%s\n", ( char *)parameterpointer );
-
-		else if( parametertype == 'F' )	//If a floating point
-				sprintf( tbuf, "%f\n", *( float *)parameterpointer );
-
-		else if( parametertype == 'N' )	//If a decimal number
-				sprintf( tbuf, "%d\n", *( int *)parameterpointer );
-
-
-		SafeStringConcatinate( buffer, tbuf, ((sizeof(char) * MAXPATH * 2)) );
-		i++;		//Until the end
-	}
-
-	FILE	*WriteFile = fopen ( PARAMETERFILENAME,"wb+");			//Open the file
 		if (WriteFile  == NULL) RenumError( "Can't create parameter file!", PARAMWRITECREATEERROR );
 
-		i = strlen( buffer );
+		fprintf( WriteFile, "%s=%s\n", NewParameterList[0], Params->projectfilename);
+		fprintf( WriteFile, "%s=%d\n", NewParameterList[3], Params->topsortcode);
+		fprintf( WriteFile, "%s=%d\n", NewParameterList[4], Params->bottomsortcode);
+		fprintf( WriteFile, "%s=%d\n", NewParameterList[5], Params->topstartrefdes);
+		fprintf( WriteFile, "%s=%d\n", NewParameterList[6], Params->bottomstartrefdes);
+		fprintf( WriteFile, "%s=%d\n", NewParameterList[7], Params->sortonmodules);
+        fprintf( WriteFile, "%s=%f\n", NewParameterList[8], Params->grid);
+        fprintf( WriteFile, "%s=%d\n", NewParameterList[9], Params->log);
 
-		if( fwrite( buffer, sizeof(char), i, WriteFile ) != i )
-			RenumError( "Can't write parameter file!", PARAMWRITECREATEERROR );
 		fclose( WriteFile );
-
 	}	//WriteParameterFile()
 
 //
 // This loads the parameter file from the local directory and sets the values
 //
-void	LoadParameterFile( void )
+void	LoadParameterFile( struct RenumParams *Params )
 {
-int		i, j;
-char 	parametertype;
-void	*parameterpointer;
+long	sizeparams;
 
-FILE	*ReadFile = fopen ( PARAMETERFILENAME,"rb");			//Open the file read only binary
-		if (ReadFile  == NULL) return;
+		if( 0 != access(Params->paramfilename, F_OK)) return;		//File not found
 
-		fseek(ReadFile, 0L, SEEK_END);							//Go to the end of the file
-long	filesize = sizeof(char) * (ftell( ReadFile ));			//Where am I?
-		fseek(ReadFile, 0L, SEEK_SET);							//Go to the start of the file
-
-char	buffer[ ((sizeof(char) * filesize ) + 2) ]; 	 		// allocate memory to contain the whole file plus a '\0'
-char	*bufpnt = buffer;
-char	dest[ ((sizeof(char) * filesize ) + 2) ]; 	 		// allocate memory to contain the whole file plus a '\0'
-
-		if( fread (buffer, sizeof( char ), filesize, ReadFile ) != filesize ) 	// And read the file into memory
-			RenumError("Paramter file read error", MALLOCERROR );		//I am out of here
+char	*buffer = LoadFile( Params->paramfilename, &sizeparams );
+char	dest[ sizeparams + 2];		 	 		// allocate memory to contain the whole file plus a '\0'
+char	*cpnt;
+char	*found;
+int		i;
 //
 // Now i have the parameter file in buffer
 //
-		buffer[ (sizeof(char) * filesize ) ] = '\0';
-		do {													//Copy a string to a work buffer
-			i = 0;												//From the beginning
-			while(( *bufpnt != '\0' ) && (*bufpnt != '\n'))		//Until end or newline
-				dest[i++] = *bufpnt++;
+char	*bufpnt = buffer;
+		do			// Process a line at a time
+		{														//Copy a string to a work buffer
+			cpnt = strchr( bufpnt, '\n');						//Look for EOL
+			if( NULL == cpnt )
+				cpnt = strchr( bufpnt, '\0' );					//Not found: look for EOF
 
-			if( i > 0 )			//File not finished
+			if( NULL == cpnt )									//Not found: something wrong
 			{
-				dest[i] = '\0';									//Make an end of line
-				while(( *bufpnt <= ' ') && (*bufpnt != '\0')) bufpnt++; //Skip to next line
+				printf("\n\nInvalid Parameter File!" );
+				if( NULL != buffer ) free( buffer );
+				return;
+			}
+			else
+				*cpnt++ = '\0';									//End it here (cpnt points past \n)
+			strcpy( dest, bufpnt );								//Copy the line into dest
 
-				do	if( dest[i] == '=') break; while( --i > 0 ); //Find the equals sign (delimits name, value
+			bufpnt = cpnt;										//Next time start from here
+			while(( *bufpnt <= ' ') && (*bufpnt != '\0')) bufpnt++; //Look for a printable character or EOF
 
-				if( i == 0 )
-					printf("\n\nInvalid Parameter File! %s ", dest );
-				else // I have a likely valid parameter line
+			if( '\0' != dest [ 0 ] )							//File not finished
+			{
+				cpnt = strchr( dest, '=');								//Look for =
+				if( NULL == cpnt )				//Not found: something wrong
+				{	printf("\n\nInvalid Parameter File no = in %s ", dest );
+					if( NULL != buffer ) free( buffer );
+					return;
+				}
+				else
 				{
-					dest[i++] = '\0';						//Terminate parameter name, point to next character
-
-					j = 0;
-
-					while(G_ParameterFile[j].Parametername != 0 )
+					found = NULL;
+					*cpnt++ = '\0';									//Split line at equals sign
+					for( i = 0; (( NULL == found ) && ( i < ( sizeof( NewParameterList) / sizeof( char *)))); i++)
 					{
-						if( strstr( G_ParameterFile[j].Parametername, dest ) == G_ParameterFile[j].Parametername )	//Did I find the parameter?
+						found = strstr( NewParameterList[i], dest );	//If the text is found
+						if( NULL != found )					//If the text is found
 						{
-							parametertype = G_ParameterFile[j].Parametertype;
-							parameterpointer = G_ParameterFile[j].Pointertoparameter;
-
-							if( parametertype == 'T' )				//If a text field
-									sprintf( ( char *)parameterpointer, "%s", dest + i );
-
-							else if( parametertype == 'N' )			//If a decimal number
-									*( int *)parameterpointer = atoi( dest + i );
-
-							else if( parametertype == 'F' )			//If a float number
+							switch ( i )
 							{
-								float tmp = atof( dest + i );
-								if( tmp < 0 ) tmp = -tmp;
-								*( float *)parameterpointer = tmp;
+							case 0 : strcpy( Params->projectfilename, cpnt ); break;
+							case 3 : Params->topsortcode = atoi( cpnt ); break;
+							case 4 : Params->bottomsortcode = atoi( cpnt ); break;
+							case 5 : Params->topstartrefdes = atoi( cpnt ); break;
+							case 6 : Params->bottomstartrefdes = atoi( cpnt ); break;
+							case 7 : Params->sortonmodules= atoi( cpnt ); break;
+                            case 8 : Params->grid = fabs( atof( cpnt )); break;
+                            case 9 : Params->log = atoi( cpnt ); break;                   //For logging -
+							default : printf("\nParameter %s Invalid! ", dest ); break;
 							}
+						}
 
-							break;
-						} else( j++ );
 					}
-
-					if(G_ParameterFile[j].Parametername == 0 )
-						printf("\n   Not found! [%s] [%s]", dest, dest+i);
 				}
 			}
-		} while( i != 0 );	//Until the end of the file
+		} while( '\0' != *bufpnt );	//Until the end of the file
+		if( NULL != buffer ) free( buffer );
 }
 
 
-void	ResetParameters( void )
-{
-		G_InputFileName = "";							//The input file name set by command line
-		G_TopPrepend = "";								//T_";
-		G_BottomPrepend = "";							//Optional strings to prepend to new refdeses
-		G_NoQuestion = 0;								//Don't ask if OK
-		G_TopSortCode = SORTYFIRST + ASCENDINGFIRST + ASCENDINGSECOND;
-		G_BottomSortCode = SORTYFIRST + ASCENDINGFIRST + DESCENDINGSECOND;
-
-		G_TopStartRefDes = 1;							//Start at 1 for the top
-		G_BottomStartRefDes = 0;	//1;				//Start at 1 for the bottom (this is optional)
-		G_SortOnModules = 1;							//if 0 sort on ref des location
-		G_Grid = 1.0;									//Anything near this (mm) is in the same line
-} //ResetParameters
 
 
-
-
-void	ShowMenu( void )
+void	ShowMenu( struct RenumParams *Params )
 {
 	printf("\n\n*****************************************************************");
-	printf("\n[1] KiCad design file root PCB name : %s", G_InputFileName );
-	printf("\n[2] Front sort: %s ", GetMenuString( G_DirectionsArray, G_TopSortCode ) );
-	printf("\n[3] Front reference designators start at %d", G_TopStartRefDes);
+	printf("\n[P] KiCad PCB file name : %s", Params->projectfilename );
+	printf("\n[2] Front sort: %s ", GetMenuString( G_DirectionsArray, Params->topsortcode ) );
+	printf("\n[3] Front reference designators start at %d", Params->topstartrefdes );
 
-	printf("\n[4] Back sort: %s", GetMenuString( G_DirectionsArray, G_BottomSortCode ) );
+	printf("\n[4] Back sort: %s", GetMenuString( G_DirectionsArray, Params->bottomsortcode ) );
 	printf("\n[5] Back reference designators start " );
 
-	if( G_BottomStartRefDes == 0 )
+	if( Params->bottomstartrefdes == 0 )
 		printf("where the front ends ");
 	else
-		printf("at %d ", G_BottomStartRefDes );
+		printf("at %d ", Params->bottomstartrefdes );
 
-	printf("\n[6] Sorting on: %s ", GetMenuString( G_ModulesRefDesArray, G_SortOnModules ));
-	printf("\n[7] There is a grid setting of: %.3f", G_Grid );
+	printf("\n[6] Sorting on: %s ", GetMenuString( G_ModulesRefDesArray, Params->sortonmodules ));
+	printf("\n[7] There is a grid setting of: %.3f", Params->grid );
 
-	printf("\n[8] Front references designators prepend string: %s", G_TopPrepend );
-	printf("\n[9] Back references designators prepend string: %s", G_BottomPrepend );
+	printf("\n[8] Front references designators prepend string %s", Params->TopPrepend );
+	printf("\n[9] Back references designators prepend string: %s", Params->BotPrepend );
 
-	if(( strlen( G_TopPrepend ) != 0 ) || ( strlen( G_BottomPrepend ) != 0 ))
-			printf("\n\t\t ******* Warning only use prepends once per side: they add up! *******\n");
-
-	printf("\n[L] Load parameters.");
-	printf("\n[Z] Reset to defaults.");
-	printf("\n[H] Show the command line syntax ");
+	if(( strlen( Params->TopPrepend ) != 0 ) || ( strlen( Params->BotPrepend ) != 0 ))
+	{
+			printf("\n\n\t\t ******* Warning only use prepends once per side: they add up! *******");
+            printf("\n\t\t ******* Remove prepend with a -, i.e. -F_ *******\n");
+	}
 } //ShowMenu()
 
+//
+//	If there is a file extension, remove it and add it to the filename
+//	Return 0 if the file exists, else return 1
+//
 
+//
+// Check the project filename
+//
+int	CheckProjectFileName( struct RenumParams *Params )
+{
+    if( 0 == strlen( Params->projectfilename )) return( -1 );   //Can't do much without the
+    TrimExtension( Params->projectfilename, ".pro");            //Trim the extension if it is there
+    if( 0 == CheckInputFileName( Params, ".pro" ))
+    {
+        printf("\n*** Kicad project file not found! *** " );
+        return( 1 );
+    } else return( 0 );
+}
 
 /*
  * Show what you are going to do and unless -Y parameter, allow changes/updates
 char	G_TopPrependString[ MAXPREPEND ];
-char	G_BottomPrependString[ MAXPREPEND ];
+char	G_BottomPrependString[ MAXPREPEND ];".kicad_pcb"
  *
  */
-void	ShowAndGetParameters( )
+void	ShowAndGetParameters( struct RenumParams *Params )
 {
-int		i = -1;
-	printf("\n\n");
+int	i;
+
+    printf("\n\n");
 	printf("%s\n", G_HELLO );
+    printf("Compiled %s %s", __DATE__, __TIME__);
 
-	if( strlen( G_InputFileName ) != 0 )
-		SafeStringCopy( G_FileName, G_InputFileName, MAXPATH );
+	LoadParameterFile( Params  );				//Try and load the parameter file
+	CheckProjectFileName( Params );
 
-	else
+	ShowMenu( Params );						//Say what is going on
+	do
 	{
-		LoadParameterFile(  );				//Try and load the parameter file
-		G_InputFileName = G_FileName;
-	}
+		CheckProjectFileName( Params );
+		printf("\n\nEnter number or letter in brackets 'R' to Run (ctl-C aborts): ");
 
-	i = CheckInputFileName();					//If a name, check if exists
+#ifdef _ECLIPSEDEBUG
+		i = 'R';
+#else
+		i = toupper( mygetch());			//Get the reply
+#endif
 
-	if( i == 0 )
-	{
-		ShowMenu( );								//Say what is going on
-		i = GetInputFileName();									//If no name or invalid get name
-	}
-
-	if(( G_NoQuestion == 0 ) || ( i == 0 ))				//Unless directed to skip this
-	{
-		ShowMenu( );						//Say what is going on
-		do
+		if( i == ABORT )
 		{
-			printf("\n\nEnter number or letter in brackets or 'R' to Run (ctl-C aborts): ");
-			i = toupper( mygetch());			//Get the reply
-			if( i == ABORT )
-			{
-				gettimeofday( &G_StartTime, NULL );				//Get the start time
-				FreeMemoryAndExit( 0 );							//Control C
+			gettimeofday( &Params->StartTime, NULL );				//Get the start time
+			FreeMemoryAndExit( 0 );							//Control C
+		}
+		printf("%c\n\n", i );
+
+
+		switch ( i )
+		{
+			case 'P' :
+			    StringGet( "\n\nFile name: ", Params->projectfilename, Params->projectfilename, MAXPATH );
+				CheckProjectFileName( Params );
+			break;
+
+			case '2' :
+				MenuSelect( "Front sort direction: ", G_DirectionsArray, &Params->topsortcode );
+			break;
+
+			case '3' :
+				sprintf( G_ERRSTR, "%d", Params->topstartrefdes );
+				StringGet( "Front reference designators start: ", G_ERRSTR, G_ERRSTR, 6 );
+				Params->topstartrefdes = abs( atoi( G_ERRSTR ) );
+				if( Params->topstartrefdes == 0 ) Params->topstartrefdes = 1;
+			break;
+
+			case '4' :
+				MenuSelect( "Back sort direction: ", G_DirectionsArray, &Params->bottomsortcode);
+			break;
+
+			case '5' :
+				sprintf( G_ERRSTR, "%d", Params->bottomsortcode );
+				StringGet( "Back reference designators start (0 means where Front ends): ", G_ERRSTR, G_ERRSTR, 6 );
+				Params->bottomsortcode = abs( atoi( G_ERRSTR ) );
+			break;
+
+			case '6' :
+				MenuSelect("Sort on: ", G_ModulesRefDesArray, &Params->sortonmodules );
+			break;
+
+			case '7' :
+				sprintf( G_ERRSTR, "%.3f", Params->grid );
+				StringGet( "Grid Setting: ",  G_ERRSTR, G_ERRSTR, 10 );
+				Params->grid = fabs( atof( G_ERRSTR ));
+
+			break;
+
+			case '8' :
+				StringGet( "Front reference designator prepend string", Params->TopPrepend, Params->TopPrepend, MAXREFDES );
+			break;
+
+			case '9' :
+				StringGet( "Back reference designator prepend string", Params->BotPrepend, Params->BotPrepend, MAXREFDES );
+			break;
+
+			case 'R' : break;
+
+			default : printf("\nInvalid selection" ); break;
 			}
-			printf("%c\n\n", i );
-
-			switch ( i )
-			{
-				case '1' :
-					GetInputFileName( );
-				break;
-
-				case '2' :
-					MenuSelect( "Front sort direction: ", G_DirectionsArray, &G_TopSortCode );
-				break;
-
-				case '3' :
-					sprintf( G_ERRSTR, "%d", G_TopStartRefDes );
-					StringGet( "Front reference designators start: ", G_ERRSTR, G_ERRSTR, 6 );
-					G_TopStartRefDes = abs( atoi( G_ERRSTR ) );
-					if( G_TopStartRefDes == 0 ) G_TopStartRefDes = 1;
-				break;
-
-				case '4' :
-					MenuSelect( "Back sort direction: ", G_DirectionsArray, &G_BottomSortCode );
-				break;
-
-				case '5' :
-					sprintf( G_ERRSTR, "%d", G_BottomStartRefDes );
-					StringGet( "Back reference designators start (0 means where Front ends): ", G_ERRSTR, G_ERRSTR, 6 );
-					G_BottomStartRefDes = abs( atoi( G_ERRSTR ) );
-					break;
-
-				case '6' :
-					MenuSelect("Sort on: ", G_ModulesRefDesArray, &G_SortOnModules );
-				break;
-
-				case '7' :
-					sprintf( G_ERRSTR, "%.3f", G_Grid );
-					StringGet( "Grid Setting: ",  G_ERRSTR, G_ERRSTR, 10 );
-					G_Grid = atof( G_ERRSTR );
-					if( G_Grid < 0 ) G_Grid = - G_Grid;
-
-				break;
-
-				case '8' :
-					StringGet( "Front reference designator prepend string", G_TopPrependString, G_TopPrepend, MAXPREPEND );
-					G_TopPrepend = G_TopPrependString;
-				break;
-
-				case '9' :
-					StringGet( "Back reference designator prepend string", G_BottomPrependString, G_BottomPrepend,  MAXPREPEND );
-					G_BottomPrepend = G_BottomPrependString;
-				break;
-
-				case 'H' :
-					PrintHelpFile( NULL );				//Use a dummy argument
-					break;
-
-				case 'L' :
-					LoadParameterFile(  );
-					G_InputFileName = G_FileName;
-					break;
-
-				case 'Z' :
-					ResetParameters( );
-					break;
-
-				case 'R' : break;
-
-				default : printf("\nInvalid selection" ); break;
-			}
-			if( i != 'R') ShowMenu( );						//Say what is going on
+			if( i != 'R') ShowMenu( Params );						//Say what is going on
 		} while( i != 'R');
-	}
-	gettimeofday( &G_StartTime, NULL );				//Get the start time
-}
-
-/*
- * The help file
- */
-
-
-char	G_HELPFILE[] = "\nRenumKiCadPCB " VERSION " command line options\n"
-"-iINFILE	The Input file names (INFILE.kicad_pcb, INFILE.sch) (required)\n"
-"		INFILE is renamed infileRenumBack.kicad_pcb, infileRenumBack.sch\n\n"
-"-fsSORTSPEC	Front sort direction\n"
-"		-fs[1ST][2ND] where [1ST] or [2ND] are TB (top to bottom) or LR (left to right)\n"
-"		DEFAULT is -fsTBLR (top to bottom, left to right)\n"
-"-bsSORTSPEC	Bottom sort direction same arguments as -fs\n\n"
-"		DEFAULT is -bsTBRL (top to bottom, right to left)\n\n"
-"-jSPACING	Set the sort grid spacing (i.e 0.1 and 0.15 are the same if grid is 0.5)\n\n"
-"-fpSTR		Top refdes prepend string (i.e. tpT_ means R1 will be T_R1 if it is on top side)\n"
-"		DEFAULT is empty\n\n"
-"-bpSTR		Bottom refdes prepend string (i.e. bpB_ means R2 will be B_R2 if it is on bottom side)\n"
-"		DEFAULT is empty\n\n"
-"-frNUM		Top refdes start value (i.e. fp100 means parts will start at 100 on the front side)\n"
-"		DEFAULT is 1\n\n"
-"-brNUM		Bottom refdes start value (i.e. br100 means R2 will be R102 if it is on bottom side)\n"
-"		DEFAULT is to continue from the last front refdes)\n\n"
-"-m		Sort on module location. Default is sort on Ref Des Location)\n"
-"-y		No Y/N question asked\n"
-"-z		Zero settings (reset to defaults)\n"
-"-?		Print out this file\n\n";
-
-
-/*
- * Print out the command list
- */
-
-void	PrintHelpFile( char *argv )
-{
-	printf("%s", G_HELPFILE );
-	if(argv!=NULL) exit(0); // Exit when the tool is not interactive
+	gettimeofday( &Params->StartTime, NULL );				//Get the start time
 }
 
 
