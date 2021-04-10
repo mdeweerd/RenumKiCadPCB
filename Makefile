@@ -2,9 +2,9 @@
 # 'RenumKiCadPCB' Makefile 
 #
 ifeq ($(OS),Windows_NT)
-    EXEEXT := 
-else
     EXEEXT := .EXE
+else
+    EXEEXT := 
 endif
 
 
